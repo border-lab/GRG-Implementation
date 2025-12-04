@@ -97,7 +97,7 @@ def recurse_attach(grg, current_node, offspring, interval, adding_nodes):
         recurse_attach(grg, parent, offspring, overlap, adding_nodes)
 
 
-def recurse_duplication(grg, current_node, offspring, interval):
+def recurse_duplicate(grg, current_node, offspring, interval):
     L, R = interval
     if L >= R:
         return
@@ -134,7 +134,7 @@ def recurse_duplication(grg, current_node, offspring, interval):
             
             # Recursively process parent nodes
             for parent in current_node.parents.keys():
-                recurse_duplication(grg, parent, offspring, [L, R])
+                recurse_duplicate(grg, parent, offspring, [L, R])
             return
     
     # Condition 3: Bounds above are within [L, R], but not all current mutations are needed
@@ -171,7 +171,7 @@ def recurse_duplication(grg, current_node, offspring, interval):
     
     # Default: continue traversing up to parents
     for parent in current_node.parents.keys():
-        recurse_duplication(grg, parent, offspring, [L, R])
+        recurse_duplicate(grg, parent, offspring, [L, R])
 
 
 def recombine(grg_obj, hapA_id, hapB_id, breakpoint, new_hap_id, new_ind_id, ADDING_NODES=True):
@@ -194,9 +194,9 @@ def recombine(grg_obj, hapA_id, hapB_id, breakpoint, new_hap_id, new_ind_id, ADD
     nodeB = grg_obj.haplotype_endpoints[hapB_id]
 
     if breakpoint > 0:
-        recurse_attach(grg_obj, nodeA, offspring, [0, breakpoint], ADDING_NODES)
+        recurse_duplicate(grg_obj, nodeA, offspring, [0, breakpoint])
     
     if breakpoint < max_limit:
-        recurse_attach(grg_obj, nodeB, offspring, [breakpoint, max_limit], ADDING_NODES)
+        recurse_duplicate(grg_obj, nodeB, offspring, [breakpoint, max_limit])
 
     return offspring
