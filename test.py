@@ -6,14 +6,14 @@ import numpy as np
 from recombination import *
 from plot_grg import *
 
-n0 = grg.Node(0, (3, 6, 7))
-n1 = grg.Node(1, (4))
-n2 = grg.Node(2, (11))
-n3 = grg.Node(3, (1))
-n4 = grg.Node(4, (2, 9))
-n5 = grg.Node(5, (0))
-n6 = grg.Node(6, (8))
-n7 = grg.Node(7, (5, 10))
+n0 = grg.Node(0, (2, 3))
+n1 = grg.Node(1, (1))
+n2 = grg.Node(2, (4))
+n3 = grg.Node(3, (5))
+n4 = grg.Node(4, (6, 7))
+n5 = grg.Node(5, (8))
+n6 = grg.Node(6, (9))
+n7 = grg.Node(7, (10, 11))
 
 full = [0, 12]
 
@@ -56,9 +56,9 @@ print(json.dumps(individual_to_mutation_map, indent=2))
 # Recombine hapA and hapC at breakpoint 6 into new hapE
 offspring_node = recombine(
     grg_,
-    hapA_id="hapA",
-    hapB_id="hapC",
-    breakpoint=6,
+    hapA_id="hapB",
+    hapB_id="hapA",
+    breakpoint=3,
     new_hap_id="hapE",
     new_ind_id="Individual_3",
     ADDING_NODES=True,
@@ -73,4 +73,5 @@ individual_map_after = grg_.get_individuals_to_mutations()
 print("\n=== AFTER RECOMBINATION ===")
 print(json.dumps(mutation_map_after, indent=2))
 print(json.dumps(individual_map_after, indent=2))
+print("Dot Product: ", grg.dot_product(grg_))
 plot_grg(grg_)
