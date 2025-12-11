@@ -5,6 +5,7 @@ import grg
 import numpy as np
 from recombination import *
 from plot_grg import *
+from dot_product_dup import xu_with_duplicates, xtv_with_duplicates
 
 n0 = grg.Node(0, (2, 3))
 n1 = grg.Node(1, (1))
@@ -69,6 +70,21 @@ print("\nNew offspring haplotype 'hapE' is node:", offspring_node)
 # Recompute maps after recombination
 mutation_map_after = grg_.get_mutation_to_individuals()
 individual_map_after = grg_.get_individuals_to_mutations()
+
+# Dot Product Tests
+X = grg_.to_matrix()
+u = np.array([1] * X.shape[1], dtype=float)  # Vector of ones
+v = np.array([1] * X.shape[0], dtype=float)  # Vector of ones
+
+print("\n=== DOT PRODUCT TESTS ===")
+print(np.dot(X, u))  
+print(np.dot(X.T, v))
+
+# Results
+print("\n=== DOT PRODUCT WITH DUPLICATES TESTS ===")
+print("X u with duplicates:", xu_with_duplicates(grg_, u))
+print("X^T v with duplicates:", xtv_with_duplicates(grg_, v))
+
 
 print("\n=== AFTER RECOMBINATION ===")
 print(json.dumps(mutation_map_after, indent=2))

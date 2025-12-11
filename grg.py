@@ -227,7 +227,7 @@ class GRG:
                 matrix[row_idx, mutation_to_col[mut]] = 1
 
         self.verify_matrix(matrix, all_mutations)
-        return matrix, all_mutations
+        return matrix
 
     # ---------- dot product over DAG ----------
 
