@@ -1,0 +1,73 @@
+{
+  "system_info": {
+    "numpy_version": "1.23.5",
+    "pygrgl_version": "unknown",
+    "platform": "Darwin-24.3.0-arm64",
+    "cpu_count": 12,
+    "timestamp": "2026-04-27 17:36:17"
+  },
+  "config": {
+    "warmup_runs": 1,
+    "timed_runs": 3,
+    "num_offspring": 100,
+    "memory_limit_mb": 15000.0
+  },
+  "results": [
+    {
+      "file": "50inds_1k_snps.grg",
+      "num_offspring": 100,
+      "implementation": "GRG Native",
+      "num_samples_initial": 100,
+      "num_snps": 1000,
+      "num_runs": 3,
+      "mean_time_ms": 83.74999999999997,
+      "std_time_ms": 6.911124449725416,
+      "min_time_ms": 75.340917,
+      "max_time_ms": 92.26858299999996,
+      "nodes_added": 702,
+      "memory_mb": 0.0
+    },
+    {
+      "file": "50inds_1k_snps.grg",
+      "num_offspring": 100,
+      "implementation": "NumPy Baseline",
+      "num_samples_initial": 100,
+      "num_snps": 1000,
+      "num_runs": 3,
+      "mean_time_ms": 1.3253470000000138,
+      "std_time_ms": 0.09679688783218245,
+      "min_time_ms": 1.2140830000000324,
+      "max_time_ms": 1.4500419999999847,
+      "nodes_added": 0,
+      "memory_mb": 0.19073486328125
+    },
+    {
+      "file": "500inds_10k_snps.grg",
+      "num_offspring": 1000,
+      "implementation": "GRG Native",
+      "num_samples_initial": 1000,
+      "num_snps": 10000,
+      "num_runs": 3,
+      "mean_time_ms": 14349.230180666666,
+      "std_time_ms": 150.85408122233147,
+      "min_time_ms": 14162.053582999995,
+      "max_time_ms": 14531.470167000001,
+      "nodes_added": 9278,
+      "memory_mb": 0.0
+    },
+    {
+      "file": "500inds_10k_snps.grg",
+      "num_offspring": 100,
+      "implementation": "NumPy Baseline",
+      "num_samples_initial": 1000,
+      "num_snps": 10000,
+      "num_runs": 3,
+      "mean_time_ms": 13.934374666667063,
+      "std_time_ms": 0.16621937130994516,
+      "min_time_ms": 13.77949999999828,
+      "max_time_ms": 14.16495800000206,
+      "nodes_added": 0,
+      "memory_mb": 10.49041748046875
+    }
+  ]
+}
