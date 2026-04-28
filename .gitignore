@@ -1,0 +1,12 @@
+# Ignore grg test files
+benchmark/test_grg_files
+benchmark/test_small
+
+# Ignore benchmark output
+benchmark/output
+
+# Ignore benchmark environment
+benchmark/.venv
+
+# Ignore local grgl package
+benchmark/grgl
