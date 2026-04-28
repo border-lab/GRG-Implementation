@@ -735,10 +735,10 @@ class NonDuplicationRecombination:
             self.NEGATIVE_NODE_IDS.append(offspring_id)
         return -(self.NEGATIVE_NODE_IDS.index(offspring_id) + 1)
 
-def simulate_grg_recombination(grg, bp_range, N):
-    recombiner = NonDuplicationRecombination(grg)
+def simulate_grg_recombination(recomb, bp_range, N):
+    # recombiner = NonDuplicationRecombination(grg)
     
-    samples = np.array(grg.get_sample_nodes())
+    samples = np.array(recomb.grg.get_sample_nodes())
     np.random.shuffle(samples)
 
     new_offspring_ids = []
@@ -754,13 +754,13 @@ def simulate_grg_recombination(grg, bp_range, N):
             # Clear only caches for nodes that were modified in the previous offspring.
             # This preserves cache data for the ~95% of nodes that weren't touched,
             # dramatically reducing recomputation compared to clearing all caches.
-            recombiner._clear_modified_caches()
+            recomb._clear_modified_caches()
             
-            offspring_id = recombiner.recombine_multi(segments)
-            raw_id = recombiner.NEGATIVE_NODE_IDS[abs(offspring_id) - 1]
+            offspring_id = recomb.recombine_multi(segments)
+            raw_id = recomb.NEGATIVE_NODE_IDS[abs(offspring_id) - 1]
             new_offspring_ids.append(raw_id)
             
     new_offspring_ids.sort()
-    grg.set_samples(new_offspring_ids)
+    recomb.grg.set_samples(new_offspring_ids)
         
     return new_offspring_ids

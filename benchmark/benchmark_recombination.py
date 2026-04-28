@@ -20,13 +20,20 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 import pygrgl
 import re
+import psutil
 
 # Import our custom modules (ensure these are in the same directory)
-from grg_recombination import simulate_grg_recombination
-from grg_numpy_baseline import grg_to_numpy, estimate_numpy_memory, simulate_numpy_recombination
+from grg_recombination import simulate_grg_recombination, NonDuplicationRecombination
+from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
 
 # DEBUG Mode
 debug = False
+
+def get_process_memory_mb():
+    """Returns the current process memory usage in MB."""
+    process = psutil.Process(os.getpid())
+    # rss = Resident Set Size (the actual RAM used)
+    return process.memory_info().rss / (1024 * 1024)
 
 def get_breakpoints(bp_range, expected_crossovers=1.5):
     num_bp = np.random.poisson(expected_crossovers)
@@ -162,8 +169,11 @@ class RecombinationBenchmarker:
         self.print_header()
         
         # 1. Use pathlib to find the files (returns real Path objects, not strings!)
-        grg_files = list(self.grg_dir.glob("*.grg"))
-        
+        if self.grg_dir.is_dir():
+            grg_files = list(self.grg_dir.glob("*.grg"))
+        else:
+            grg_files = [self.grg_dir] if self.grg_dir.suffix == ".grg" else []
+
         # 2. Sort from smallest to largest using Path's native stat().st_size
         grg_files.sort(key=lambda x: x.stat().st_size)
         
@@ -225,9 +235,10 @@ class RecombinationBenchmarker:
         # repeat steps 1-3 for num_runs and num_warmup
 
         print("\n Generating Base NumPy Population Matrix...")
-        base_numpy_population_matrix = grg_to_numpy(pygrgl.load_mutable_grg(str(file_path)))
+        base_numpy_population_matrix = grg_to_numpy_parallel(pygrgl.load_mutable_grg(str(file_path)))
 
         grg_times = []
+        grg_sizes = []
         numpy_times = []
         nodes_added = 0
 
@@ -258,16 +269,19 @@ class RecombinationBenchmarker:
 
 
 
-            # Recombination
+            # GRG Native
+            gc.collect()
+            mem_before = get_process_memory_mb()
             print(f"\nStarting GRG Recombination Benchmarking...")
             if debug:
                 print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with GRG recombination...")
             start = time.perf_counter()
+            recomb = NonDuplicationRecombination(g)
             for gen in range(self.num_generations):
                 # Run GRG recombination for this generation
                 if debug:
                     print(f"  [Run {gen+1}] Simulating generation {gen+1} with GRG recombination...")
-                offspring_ids = simulate_grg_recombination(g, base_genome, N=base_genome[1])
+                offspring_ids = simulate_grg_recombination(recomb, base_genome, N=base_genome[1])
             elapsed = time.perf_counter() - start
             if debug:
                 print(f"  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
@@ -278,10 +292,14 @@ class RecombinationBenchmarker:
             # Grab node count on the last run for space complexity metrics
             if i == (self.num_warmup + self.num_runs - 1):
                 nodes_added = g.num_nodes - base_nodes
-                
-            del g
-            gc.collect()
             
+            gc.collect()
+            mem_after = get_process_memory_mb()
+            grg_sizes.append(mem_after - mem_before)
+            del g
+            del recomb
+
+            gc.collect()
             # Numpy
             if not skip_numpy:
                 print(f"\nStarting NumPy Recombination Benchmarking...")
@@ -300,7 +318,7 @@ class RecombinationBenchmarker:
                 if i >= self.num_warmup:
                     numpy_times.append(elapsed * 1000)  # Convert to ms
         
-        grg_mean, grg_std = np.mean(grg_times), np.std(grg_times)
+        grg_mean, grg_std, grg_sizes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes)
         if not skip_numpy:
             numpy_mean, numpy_std = np.mean(numpy_times), np.std(numpy_times)
         actual_offspring_generated = (base_samples // 2) * 2
@@ -311,7 +329,7 @@ class RecombinationBenchmarker:
             num_snps=base_mutations, num_runs=self.num_runs,
             mean_time_ms=grg_mean, std_time_ms=grg_std,
             min_time_ms=np.min(grg_times), max_time_ms=np.max(grg_times),
-            nodes_added=nodes_added, memory_mb=0.0
+            nodes_added=nodes_added, memory_mb=grg_sizes_mean
         ))
 
         if not skip_numpy:
@@ -328,6 +346,8 @@ class RecombinationBenchmarker:
 
         print(f"  GRG Native:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
         print(f"  Space Delta:    +{nodes_added} nodes created")
+        print(f"  Memory Delta:   +{grg_sizes_mean:.1f} MB (GRG recombination memory increase)")
+        print()
 
         if not skip_numpy:
             print(f"  NumPy Baseline: {numpy_mean:.2f}ms ± {numpy_std:.2f}ms")
