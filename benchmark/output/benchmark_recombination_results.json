@@ -4,7 +4,7 @@
     "pygrgl_version": "unknown",
     "platform": "Darwin-24.3.0-arm64",
     "cpu_count": 12,
-    "timestamp": "2026-04-27 23:06:00"
+    "timestamp": "2026-04-28 09:34:04"
   },
   "config": {
     "warmup_runs": 1,
@@ -20,11 +20,11 @@
       "num_samples_initial": 100,
       "num_snps": 1000,
       "num_runs": 3,
-      "mean_time_ms": 52.148222000000004,
-      "std_time_ms": 7.259615970641193,
-      "min_time_ms": 44.03379099999999,
-      "max_time_ms": 61.65245899999999,
-      "nodes_added": 715,
+      "mean_time_ms": 49.83983333333333,
+      "std_time_ms": 8.40774387803251,
+      "min_time_ms": 39.53499999999999,
+      "max_time_ms": 60.12966600000003,
+      "nodes_added": 664,
       "memory_mb": 0.0
     },
     {
@@ -34,40 +34,12 @@
       "num_samples_initial": 100,
       "num_snps": 1000,
       "num_runs": 3,
-      "mean_time_ms": 2.152527666666663,
-      "std_time_ms": 1.0641432453845374,
-      "min_time_ms": 1.373000000000013,
-      "max_time_ms": 3.6571249999999833,
+      "mean_time_ms": 1.3330280000000139,
+      "std_time_ms": 0.10987003750797097,
+      "min_time_ms": 1.1792919999999985,
+      "max_time_ms": 1.429417000000044,
       "nodes_added": 0,
       "memory_mb": 0.19073486328125
-    },
-    {
-      "file": "500inds_10k_snps.grg",
-      "num_offspring": 1000,
-      "implementation": "GRG Native",
-      "num_samples_initial": 1000,
-      "num_snps": 10000,
-      "num_runs": 3,
-      "mean_time_ms": 2271.6683333333335,
-      "std_time_ms": 43.83178342827853,
-      "min_time_ms": 2235.13425,
-      "max_time_ms": 2333.303375000001,
-      "nodes_added": 9161,
-      "memory_mb": 0.0
-    },
-    {
-      "file": "500inds_10k_snps.grg",
-      "num_offspring": 100,
-      "implementation": "NumPy Baseline",
-      "num_samples_initial": 1000,
-      "num_snps": 10000,
-      "num_runs": 3,
-      "mean_time_ms": 15.08284733333376,
-      "std_time_ms": 0.9775871594390803,
-      "min_time_ms": 14.252083999999776,
-      "max_time_ms": 16.45525000000081,
-      "nodes_added": 0,
-      "memory_mb": 10.49041748046875
     }
   ]
 }

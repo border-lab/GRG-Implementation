@@ -13,9 +13,6 @@ def estimate_numpy_memory(num_mutations, num_samples, dtype_size=1):
     bytes_required = num_mutations * num_samples * dtype_size
     return bytes_required / (1024 * 1024)
 
-from collections import deque
-import numpy as np
-
 def grg_to_numpy(g):
     """
     Converts a GRG to a dense NumPy genotype matrix using a bottom-up traversal.
