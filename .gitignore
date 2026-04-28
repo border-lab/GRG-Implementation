@@ -10,3 +10,6 @@ benchmark/.venv
 
 # Ignore local grgl package
 benchmark/grgl
+
+# Ignore benchmark zip
+benchmark/recombination_benchmark.zip

@@ -206,7 +206,12 @@ class RecombinationBenchmarker:
         # Estimate memory for the POST-recombination NumPy array
         # It will have (base_samples + num_offspring) columns
         est_mb = estimate_numpy_memory(base_mutations, base_samples + self.num_offspring)
-        
+
+        skip_numpy = False
+        if est_mb > self.memory_limit_mb:
+            print(f"  [Skipping NumPy] Estimated memory ({est_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB)")
+            skip_numpy = True
+
         print(f" Actual Base: {base_samples} samples, {base_mutations} mutations, {base_nodes} nodes")
         print(f" Estimated memory for NumPy array (post-recomb): {est_mb:.1f} MB")
         
@@ -278,28 +283,26 @@ class RecombinationBenchmarker:
             gc.collect()
             
             # Numpy
-            if est_mb > self.memory_limit_mb:
-                print(f"  [Skipping NumPy] Estimated memory ({est_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB)")
-                return
-            
-            print(f"\nStarting NumPy Recombination Benchmarking...")
-            if debug:
-                print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with NumPy recombination...")
-            offspring_matrix = base_numpy_population_matrix.copy()
-            start = time.perf_counter()
-            for gen in range(self.num_generations):
-                # Run NumPy recombination for this generation
+            if not skip_numpy:
+                print(f"\nStarting NumPy Recombination Benchmarking...")
                 if debug:
-                    print(f"  [Run {gen+1}] Simulating generation {gen+1} with NumPy recombination...")
-                offspring_matrix = simulate_numpy_recombination(offspring_matrix, base_genome)
-            elapsed = time.perf_counter() - start
-            if debug:
-                print(f"  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
-            if i >= self.num_warmup:
-                numpy_times.append(elapsed * 1000)  # Convert to ms
+                    print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with NumPy recombination...")
+                offspring_matrix = base_numpy_population_matrix.copy()
+                start = time.perf_counter()
+                for gen in range(self.num_generations):
+                    # Run NumPy recombination for this generation
+                    if debug:
+                        print(f"  [Run {gen+1}] Simulating generation {gen+1} with NumPy recombination...")
+                    offspring_matrix = simulate_numpy_recombination(offspring_matrix, base_genome)
+                elapsed = time.perf_counter() - start
+                if debug:
+                    print(f"  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
+                if i >= self.num_warmup:
+                    numpy_times.append(elapsed * 1000)  # Convert to ms
         
         grg_mean, grg_std = np.mean(grg_times), np.std(grg_times)
-        numpy_mean, numpy_std = np.mean(numpy_times), np.std(numpy_times)
+        if not skip_numpy:
+            numpy_mean, numpy_std = np.mean(numpy_times), np.std(numpy_times)
         actual_offspring_generated = (base_samples // 2) * 2
 
         self.results.append(BenchmarkResult(
@@ -311,25 +314,27 @@ class RecombinationBenchmarker:
             nodes_added=nodes_added, memory_mb=0.0
         ))
 
-        self.results.append(BenchmarkResult(
-            file=file_path.name, num_offspring=self.num_offspring,
-            implementation="NumPy Baseline", num_samples_initial=base_samples,
-            num_snps=base_mutations, num_runs=self.num_runs,
-            mean_time_ms=numpy_mean, std_time_ms=numpy_std,
-            min_time_ms=np.min(numpy_times), max_time_ms=np.max(numpy_times),
-            nodes_added=0, memory_mb=est_mb
-        ))
+        if not skip_numpy:
+            self.results.append(BenchmarkResult(
+                file=file_path.name, num_offspring=self.num_offspring,
+                implementation="NumPy Baseline", num_samples_initial=base_samples,
+                num_snps=base_mutations, num_runs=self.num_runs,
+                mean_time_ms=numpy_mean, std_time_ms=numpy_std,
+                min_time_ms=np.min(numpy_times), max_time_ms=np.max(numpy_times),
+                nodes_added=0, memory_mb=est_mb
+            ))
 
         print(f"\nResults for {file_path.name}:")
 
         print(f"  GRG Native:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
         print(f"  Space Delta:    +{nodes_added} nodes created")
 
-        print(f"  NumPy Baseline: {numpy_mean:.2f}ms ± {numpy_std:.2f}ms")
-        if grg_mean > 0:
-            speedup = numpy_mean / grg_mean
-            print(f"  Speedup:        {speedup:.2f}x (NumPy / GRG)")
-        print(f"  Memory Footprint: {est_mb:.1f} MB dense matrix allocated")
+        if not skip_numpy:
+            print(f"  NumPy Baseline: {numpy_mean:.2f}ms ± {numpy_std:.2f}ms")
+            if grg_mean > 0:
+                speedup = numpy_mean / grg_mean
+                print(f"  Speedup:        {speedup:.2f}x (NumPy / GRG)")
+            print(f"  Memory Footprint: {est_mb:.1f} MB dense matrix allocated")
         
         # # ---------------------------------------------------------
         # # Phase A: GRG Native Recombination
