@@ -92,30 +92,32 @@ class NonDuplicationRecombination:
         self.grg = grg
         self.genome_length = grg.bp_range[1]
         self.original_bp_range = grg.bp_range
-        self._mutation_cache = {}
         self.NEGATIVE_NODE_IDS = []
         self._modified_nodes = set()
         self._pending_bubbles = []
-        self._pending_sample_removals = set() # NEW: Defer C++ boundary crossing
+        self._pending_sample_removals = set()
+
+        # JIT Caches: These start empty and only populate for visited nodes
+        self._mutation_cache = {}  # Stores [(id, pos), ...]
+        self._pos_cache = {}       # Stores [pos, ...] for bisect
         
-        self._prefetch_all_mutations()
-        
+        # Keep these as lists/arrays for O(1) DP access
         self.span_cache = [False] * self.grg.num_nodes
         self.anc_cov_cache = [False] * self.grg.num_nodes
 
-    def _prefetch_all_mutations(self):
-        self._mutation_cache = {i: [] for i in range(self.grg.num_nodes)}
-        self._pos_cache = {} # NEW: Raw float lists for bisect
+    # def _prefetch_all_mutations(self):
+    #     self._mutation_cache = {i: [] for i in range(self.grg.num_nodes)}
+    #     self._pos_cache = {} # NEW: Raw float lists for bisect
 
-        for node_id, mut_id in self.grg.get_node_mutation_pairs():
-            mut = self.grg.get_mutation_by_id(mut_id)
-            self._mutation_cache[node_id].append((mut_id, mut.position))
+    #     for node_id, mut_id in self.grg.get_node_mutation_pairs():
+    #         mut = self.grg.get_mutation_by_id(mut_id)
+    #         self._mutation_cache[node_id].append((mut_id, mut.position))
             
-        for node_id in self._mutation_cache:
-            if self._mutation_cache[node_id]:
-                self._mutation_cache[node_id].sort(key=lambda x: x[1])
-                # Lock in a pure list of floats for O(log M) searching
-                self._pos_cache[node_id] = [m[1] for m in self._mutation_cache[node_id]]
+    #     for node_id in self._mutation_cache:
+    #         if self._mutation_cache[node_id]:
+    #             self._mutation_cache[node_id].sort(key=lambda x: x[1])
+    #             # Lock in a pure list of floats for O(log M) searching
+    #             self._pos_cache[node_id] = [m[1] for m in self._mutation_cache[node_id]]
 
     # def _get_node_mutations(self, node_id):
     #     """Get mutation positions for a node (cached, sorted by position)."""
@@ -131,18 +133,23 @@ class NonDuplicationRecombination:
     #     return self._mutation_cache[node_id]
 
     def _get_node_mutations(self, node_id):
-        """Get mutation positions for a node (cached, sorted by position)."""
-        # Because we eager loaded, this is almost always an instant native Python lookup
+        """Get mutation positions for a node (Loaded JIT and cached)."""
         if node_id not in self._mutation_cache:
-            # Fallback ONLY used for newly created bubble nodes mid-traversal
+            # Only fetch from C++ if not in cache
             mut_ids = self.grg.get_mutations_for_node(node_id)
             mutations = []
+            positions = []
+            
             for mut_id in mut_ids:
                 mut = self.grg.get_mutation_by_id(mut_id)
                 mutations.append((mut_id, mut.position))
-            # Sort by position for fast interval queries using binary search
-            mutations.sort(key=lambda x: x[1])
-            self._mutation_cache[node_id] = mutations
+                positions.append(mut.position)
+            
+            # Sort once and cache both the full data and the raw positions
+            # Use the position list specifically for fast bisecting
+            combined = sorted(mutations, key=lambda x: x[1])
+            self._mutation_cache[node_id] = combined
+            self._pos_cache[node_id] = [m[1] for m in combined]
             
         return self._mutation_cache[node_id]
     
@@ -248,10 +255,8 @@ class NonDuplicationRecombination:
 
     def _get_mutation_range(self, node_id, L, R):
         """Returns (start_idx, end_idx) for mutations in [L, R) in O(log M)."""
-        # Fallback for bubbles created mid-run
-        if node_id not in self._pos_cache:
-            node_muts = self._get_node_mutations(node_id)
-            self._pos_cache[node_id] = [m[1] for m in node_muts]
+        # Ensure data is loaded JIT
+        self._get_node_mutations(node_id)
             
         positions = self._pos_cache[node_id]
         if not positions:

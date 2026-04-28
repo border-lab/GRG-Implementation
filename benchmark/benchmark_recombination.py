@@ -27,7 +27,7 @@ from grg_recombination import simulate_grg_recombination, NonDuplicationRecombin
 from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
 
 # DEBUG Mode
-debug = False
+debug = True
 
 def get_process_memory_mb():
     """Returns the current process memory usage in MB."""
@@ -296,6 +296,7 @@ class RecombinationBenchmarker:
             gc.collect()
             mem_after = get_process_memory_mb()
             grg_sizes.append(mem_after - mem_before)
+            print(f"  [Run {i+1}] Memory usage: {mem_after:.1f} MB (Delta: +{mem_after - mem_before:.1f} MB)")
             del g
             del recomb
 
@@ -517,6 +518,7 @@ if __name__ == "__main__":
         num_warmup=args.warmup,
         num_runs=args.runs,
         num_offspring=args.offspring,
+        num_generations=args.num_generations,
         memory_limit_mb=args.memory_limit
     )
     
