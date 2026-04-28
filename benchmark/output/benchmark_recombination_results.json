@@ -4,7 +4,7 @@
     "pygrgl_version": "unknown",
     "platform": "Darwin-24.3.0-arm64",
     "cpu_count": 12,
-    "timestamp": "2026-04-27 17:36:17"
+    "timestamp": "2026-04-27 23:06:00"
   },
   "config": {
     "warmup_runs": 1,
@@ -20,11 +20,11 @@
       "num_samples_initial": 100,
       "num_snps": 1000,
       "num_runs": 3,
-      "mean_time_ms": 83.74999999999997,
-      "std_time_ms": 6.911124449725416,
-      "min_time_ms": 75.340917,
-      "max_time_ms": 92.26858299999996,
-      "nodes_added": 702,
+      "mean_time_ms": 52.148222000000004,
+      "std_time_ms": 7.259615970641193,
+      "min_time_ms": 44.03379099999999,
+      "max_time_ms": 61.65245899999999,
+      "nodes_added": 715,
       "memory_mb": 0.0
     },
     {
@@ -34,10 +34,10 @@
       "num_samples_initial": 100,
       "num_snps": 1000,
       "num_runs": 3,
-      "mean_time_ms": 1.3253470000000138,
-      "std_time_ms": 0.09679688783218245,
-      "min_time_ms": 1.2140830000000324,
-      "max_time_ms": 1.4500419999999847,
+      "mean_time_ms": 2.152527666666663,
+      "std_time_ms": 1.0641432453845374,
+      "min_time_ms": 1.373000000000013,
+      "max_time_ms": 3.6571249999999833,
       "nodes_added": 0,
       "memory_mb": 0.19073486328125
     },
@@ -48,11 +48,11 @@
       "num_samples_initial": 1000,
       "num_snps": 10000,
       "num_runs": 3,
-      "mean_time_ms": 14349.230180666666,
-      "std_time_ms": 150.85408122233147,
-      "min_time_ms": 14162.053582999995,
-      "max_time_ms": 14531.470167000001,
-      "nodes_added": 9278,
+      "mean_time_ms": 2271.6683333333335,
+      "std_time_ms": 43.83178342827853,
+      "min_time_ms": 2235.13425,
+      "max_time_ms": 2333.303375000001,
+      "nodes_added": 9161,
       "memory_mb": 0.0
     },
     {
@@ -62,10 +62,10 @@
       "num_samples_initial": 1000,
       "num_snps": 10000,
       "num_runs": 3,
-      "mean_time_ms": 13.934374666667063,
-      "std_time_ms": 0.16621937130994516,
-      "min_time_ms": 13.77949999999828,
-      "max_time_ms": 14.16495800000206,
+      "mean_time_ms": 15.08284733333376,
+      "std_time_ms": 0.9775871594390803,
+      "min_time_ms": 14.252083999999776,
+      "max_time_ms": 16.45525000000081,
       "nodes_added": 0,
       "memory_mb": 10.49041748046875
     }

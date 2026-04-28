@@ -77,20 +77,64 @@ class NonDuplicationRecombination:
 
     debug_mode = False  # Set to True to enable debug prints
     
+    # def __init__(self, grg):
+    #     self.grg = grg
+    #     self.genome_length = grg.bp_range[1]  # l_max
+    #     self.original_bp_range = grg.bp_range  # Store original bp_range for reference
+    #     self._span_cache = {}               # NEW: Caches the full ancestor span
+    #     self._ancestral_coverage_cache = {} # NEW: Caches the ancestral coverage
+    #     self._mutation_cache = {}
+    #     self.NEGATIVE_NODE_IDS = []
+    #     self._modified_nodes = set()        # Track which nodes were modified for selective cache invalidation
+    #     self._pending_bubbles = []          # Queue of bubble operations to defer until after traversal
+    
     def __init__(self, grg):
         self.grg = grg
-        self.genome_length = grg.bp_range[1]  # l_max
-        self.original_bp_range = grg.bp_range  # Store original bp_range for reference
-        self._span_cache = {}               # NEW: Caches the full ancestor span
-        self._ancestral_coverage_cache = {} # NEW: Caches the ancestral coverage
+        self.genome_length = grg.bp_range[1]
+        self.original_bp_range = grg.bp_range
         self._mutation_cache = {}
         self.NEGATIVE_NODE_IDS = []
-        self._modified_nodes = set()        # Track which nodes were modified for selective cache invalidation
-        self._pending_bubbles = []          # Queue of bubble operations to defer until after traversal
+        self._modified_nodes = set()
+        self._pending_bubbles = []
+        self._pending_sample_removals = set() # NEW: Defer C++ boundary crossing
         
+        self._prefetch_all_mutations()
+        
+        self.span_cache = [False] * self.grg.num_nodes
+        self.anc_cov_cache = [False] * self.grg.num_nodes
+
+    def _prefetch_all_mutations(self):
+        self._mutation_cache = {i: [] for i in range(self.grg.num_nodes)}
+        self._pos_cache = {} # NEW: Raw float lists for bisect
+
+        for node_id, mut_id in self.grg.get_node_mutation_pairs():
+            mut = self.grg.get_mutation_by_id(mut_id)
+            self._mutation_cache[node_id].append((mut_id, mut.position))
+            
+        for node_id in self._mutation_cache:
+            if self._mutation_cache[node_id]:
+                self._mutation_cache[node_id].sort(key=lambda x: x[1])
+                # Lock in a pure list of floats for O(log M) searching
+                self._pos_cache[node_id] = [m[1] for m in self._mutation_cache[node_id]]
+
+    # def _get_node_mutations(self, node_id):
+    #     """Get mutation positions for a node (cached, sorted by position)."""
+    #     if node_id not in self._mutation_cache:
+    #         mut_ids = self.grg.get_mutations_for_node(node_id)
+    #         mutations = []
+    #         for mut_id in mut_ids:
+    #             mut = self.grg.get_mutation_by_id(mut_id)
+    #             mutations.append((mut_id, mut.position))
+    #         # Sort by position for fast interval queries using binary search
+    #         mutations.sort(key=lambda x: x[1])
+    #         self._mutation_cache[node_id] = mutations
+    #     return self._mutation_cache[node_id]
+
     def _get_node_mutations(self, node_id):
         """Get mutation positions for a node (cached, sorted by position)."""
+        # Because we eager loaded, this is almost always an instant native Python lookup
         if node_id not in self._mutation_cache:
+            # Fallback ONLY used for newly created bubble nodes mid-traversal
             mut_ids = self.grg.get_mutations_for_node(node_id)
             mutations = []
             for mut_id in mut_ids:
@@ -99,6 +143,7 @@ class NonDuplicationRecombination:
             # Sort by position for fast interval queries using binary search
             mutations.sort(key=lambda x: x[1])
             self._mutation_cache[node_id] = mutations
+            
         return self._mutation_cache[node_id]
     
     def _get_mutations_in_interval(self, node_id, L, R):
@@ -144,62 +189,123 @@ class NonDuplicationRecombination:
                 return True
         return False
 
-    def _get_ancestral_coverage(self, node_id):
-        """Compute the ancestral interval coverage Iu (mutations in ancestors ONLY)."""
-        # 1. Check cache
-        if node_id in self._ancestral_coverage_cache:
-            return self._ancestral_coverage_cache[node_id]
+    # def _get_ancestral_coverage(self, node_id):
+    #     """Compute the ancestral interval coverage Iu (mutations in ancestors ONLY)."""
+    #     # 1. Check cache
+    #     if node_id in self._ancestral_coverage_cache:
+    #         return self._ancestral_coverage_cache[node_id]
 
-        parents = self.grg.get_up_edges(node_id)
-        if not parents:
-            self._ancestral_coverage_cache[node_id] = None
-            return None
+    #     parents = self.grg.get_up_edges(node_id)
+    #     if not parents:
+    #         self._ancestral_coverage_cache[node_id] = None
+    #         return None
             
-        min_pos, max_pos = float('inf'), float('-inf')
-        visited = set() 
+    #     min_pos, max_pos = float('inf'), float('-inf')
+    #     visited = set() 
         
-        for parent in parents:
-            parent_span = self._get_node_and_ancestor_span(parent, visited)
-            if parent_span:
-                min_pos = min(min_pos, parent_span[0])
-                max_pos = max(max_pos, parent_span[1])
+    #     for parent in parents:
+    #         parent_span = self._get_node_and_ancestor_span(parent, visited)
+    #         if parent_span:
+    #             min_pos = min(min_pos, parent_span[0])
+    #             max_pos = max(max_pos, parent_span[1])
         
-        # 2. Format result and cache it
-        result = None if min_pos == float('inf') else (min_pos, max_pos + 1)
+    #     # 2. Format result and cache it
+    #     result = None if min_pos == float('inf') else (min_pos, max_pos + 1)
         
-        self._ancestral_coverage_cache[node_id] = result
-        return result
+    #     self._ancestral_coverage_cache[node_id] = result
+    #     return result
 
-    def _get_node_and_ancestor_span(self, node_id, visited):
-        """Recursive helper: gets span of mutations for this node and its ancestors."""
-        # 1. Check cache
-        if node_id in self._span_cache:
-            return self._span_cache[node_id]
+    # def _get_node_and_ancestor_span(self, node_id, visited):
+    #     """Recursive helper: gets span of mutations for this node and its ancestors."""
+    #     # 1. Check cache
+    #     if node_id in self._span_cache:
+    #         return self._span_cache[node_id]
             
-        if node_id in visited:
-            return None
-        visited.add(node_id)
+    #     if node_id in visited:
+    #         return None
+    #     visited.add(node_id)
         
+    #     min_pos, max_pos = float('inf'), float('-inf')
+        
+    #     # 2. Check this node's mutations
+    #     node_muts = self._get_node_mutations(node_id)
+    #     if node_muts:
+    #         min_pos = min(min_pos, min(pos for _, pos in node_muts))
+    #         max_pos = max(max_pos, max(pos for _, pos in node_muts))
+        
+    #     # 3. Recurse to parents
+    #     for parent in self.grg.get_up_edges(node_id):
+    #         anc_span = self._get_node_and_ancestor_span(parent, visited)
+    #         if anc_span:
+    #             min_pos = min(min_pos, anc_span[0])
+    #             max_pos = max(max_pos, anc_span[1])
+                
+    #     # 4. Format result and cache it
+    #     result = None if min_pos == float('inf') else (min_pos, max_pos)
+        
+    #     self._span_cache[node_id] = result
+    #     return result
+
+    def _get_mutation_range(self, node_id, L, R):
+        """Returns (start_idx, end_idx) for mutations in [L, R) in O(log M)."""
+        # Fallback for bubbles created mid-run
+        if node_id not in self._pos_cache:
+            node_muts = self._get_node_mutations(node_id)
+            self._pos_cache[node_id] = [m[1] for m in node_muts]
+            
+        positions = self._pos_cache[node_id]
+        if not positions:
+            return 0, 0
+            
+        return bisect.bisect_left(positions, L), bisect.bisect_left(positions, R)
+
+    def _get_node_and_ancestor_span(self, node_id):
+        """Lazy recursive helper using array memoization."""
+        # 1. Instant Array Cache Hit
+        if self.span_cache[node_id] is not False:
+            return self.span_cache[node_id]
+            
         min_pos, max_pos = float('inf'), float('-inf')
         
         # 2. Check this node's mutations
         node_muts = self._get_node_mutations(node_id)
         if node_muts:
-            min_pos = min(min_pos, min(pos for _, pos in node_muts))
-            max_pos = max(max_pos, max(pos for _, pos in node_muts))
+            min_pos = node_muts[0][1]
+            max_pos = node_muts[-1][1]
         
-        # 3. Recurse to parents
+        # 3. Recurse to parents (only runs once per node)
         for parent in self.grg.get_up_edges(node_id):
-            anc_span = self._get_node_and_ancestor_span(parent, visited)
+            anc_span = self._get_node_and_ancestor_span(parent)
             if anc_span:
                 min_pos = min(min_pos, anc_span[0])
                 max_pos = max(max_pos, anc_span[1])
                 
-        # 4. Format result and cache it
+        # 4. Format result and lock it in the array
         result = None if min_pos == float('inf') else (min_pos, max_pos)
-        
-        self._span_cache[node_id] = result
+        self.span_cache[node_id] = result
         return result
+
+    def _get_ancestral_coverage(self, node_id):
+        """Compute Iu lazily using array memoization."""
+        if self.anc_cov_cache[node_id] is not False:
+            return self.anc_cov_cache[node_id]
+
+        parents = self.grg.get_up_edges(node_id)
+        if not parents:
+            self.anc_cov_cache[node_id] = None
+            return None
+            
+        min_pos, max_pos = float('inf'), float('-inf')
+        
+        for parent in parents:
+            p_span = self._get_node_and_ancestor_span(parent)
+            if p_span:
+                min_pos = min(min_pos, p_span[0])
+                max_pos = max(max_pos, p_span[1])
+                
+        result = None if min_pos == float('inf') else (min_pos, max_pos + 1)
+        self.anc_cov_cache[node_id] = result
+        return result   
     
     def _extract_bubble(self, node_id, relevant_mut_ids, offspring_id, interval):
         """
@@ -226,6 +332,11 @@ class NonDuplicationRecombination:
 
         # Create new bubble node immediately (needed for edge connections)
         bubble_id = self.grg.make_node()
+
+        # Expand Lazy arrays for the new node safely
+        while len(self.span_cache) <= bubble_id:
+            self.span_cache.append(False)
+            self.anc_cov_cache.append(False)         
         
         # Add connections immediately (needed for graph structure)
         self.grg.connect(bubble_id, node_id)
@@ -251,90 +362,145 @@ class NonDuplicationRecombination:
         
         return bubble_id
     
+    # def _recurse_attach(self, node_id, offspring_id, L, R, visited=None, connected=None):
+    #     """
+    #     Recursively attach ancestry to offspring for interval [L, R).
+        
+    #     Algorithm 2: RecurseAttach
+        
+    #     Handles:
+    #     - Full Coverage (I ⊆ Iu): Ancestors fully cover query
+    #     - Disjoint (I ∩ Iu = ∅): Pruning - stop traversal
+    #     - Partial Overlap: Decomposition - recurse on intersection
+        
+    #     Args:
+    #         node_id: Current ancestor node
+    #         offspring_id: The new offspring node
+    #         L, R: Query interval [L, R)
+    #         visited: Set of already visited nodes to avoid cycles
+    #         connected: Set of nodes already connected to offspring (avoid duplicates)
+    #     """
+    #     if L >= R:
+    #         return
+        
+    #     if visited is None:
+    #         visited = set()
+    #     if connected is None:
+    #         connected = set()
+        
+    #     if node_id in visited:
+    #         return
+    #     visited.add(node_id)
+        
+    #     # # Get mutations and coverage info
+    #     # all_muts = self._get_node_mutations(node_id)
+    #     # relevant_muts = self._get_mutations_in_interval(node_id, L, R)
+        
+    #     # all_mut_ids = set(mut_id for mut_id, _ in all_muts)
+    #     # relevant_mut_ids = set(mut_id for mut_id, _ in relevant_muts)
+
+    #     # # Check mutation relevance
+    #     # has_all_relevant = (relevant_mut_ids == all_mut_ids) and len(all_mut_ids) > 0
+    #     # has_no_relevant = len(relevant_mut_ids) == 0
+    #     # has_partial_relevant = len(relevant_mut_ids) > 0 and relevant_mut_ids != all_mut_ids
+
+    #     # Get mutations and coverage info
+    #     all_muts = self._get_node_mutations(node_id)
+    #     relevant_muts = self._get_mutations_in_interval(node_id, L, R)
+        
+    #     num_all = len(all_muts)
+    #     num_rel = len(relevant_muts)
+
+    #     # NEW: FAST O(1) mathematical checks instead of O(M) set creations
+    #     has_all_relevant = (num_all > 0) and (num_rel == num_all)
+    #     has_no_relevant = (num_rel == 0)
+    #     has_partial_relevant = (num_rel > 0) and (num_rel < num_all)
+        
+    #     # Get ancestral coverage
+    #     Iu = self._get_ancestral_coverage(node_id)
+        
+    #     if self.debug_mode:
+    #         print(f"Visiting node {node_id}: all_muts={all_muts}, relevant_muts={relevant_muts}, Iu={Iu}")
+        
+    #     # Determine coverage status
+    #     if Iu is None:
+    #         if self.debug_mode:
+    #             print("No ancestral mutations - treating as root node")
+    #         if has_all_relevant:
+    #             if self.debug_mode:
+    #                 print("Root Node Case 1: All relevant mutations - connect directly")
+    #             # if (node_id not in connected and
+    #             #     not self._has_connected_descendant(node_id, connected)):
+    #             if node_id not in connected:
+    #                 self.grg.connect(node_id, -offspring_id)
+    #                 connected.add(node_id)
+
+    #                 # Queue sample removal instead of crossing into C++ immediately
+    #                 self._pending_sample_removals.add(node_id)
+
+    #                 # Remove sample status if connecting an original sample node to avoid confusion with new offspring samples
+    #                 # current_samples = list(self.grg.get_sample_nodes())
+    #                 # if node_id in current_samples:
+    #                 #     current_samples.remove(node_id)
+    #                 #     self.grg.set_samples(current_samples)
+
+    #             elif self.debug_mode:
+    #                 print(f"Node {node_id} already connected or has connected relatives, skipping direct connection")
+            
+    #         if has_partial_relevant:
+    #             if self.debug_mode:
+    #                 print("Root Node Case 2: Partial relevant mutations - create bubble and connect")
+                
+    #             # Generate the list of IDs ONLY if a bubble is actually needed
+    #             rel_mut_ids = [mut_id for mut_id, _ in relevant_muts]
+    #             bubble_id = self._extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
+    #             connected.add(bubble_id)
+                
+    #             # bubble_id = self._extract_bubble(node_id, list(relevant_mut_ids), 
+    #             #                                         offspring_id, (L, R))
+    #             # connected.add(bubble_id)
+    #             # connected.add(node_id)
+            
+    #         return # Stop - lineage fully resolved
+
     def _recurse_attach(self, node_id, offspring_id, L, R, visited=None, connected=None):
-        """
-        Recursively attach ancestry to offspring for interval [L, R).
+        if L >= R: return
         
-        Algorithm 2: RecurseAttach
+        if visited is None: visited = set()
+        if connected is None: connected = set()
         
-        Handles:
-        - Full Coverage (I ⊆ Iu): Ancestors fully cover query
-        - Disjoint (I ∩ Iu = ∅): Pruning - stop traversal
-        - Partial Overlap: Decomposition - recurse on intersection
-        
-        Args:
-            node_id: Current ancestor node
-            offspring_id: The new offspring node
-            L, R: Query interval [L, R)
-            visited: Set of already visited nodes to avoid cycles
-            connected: Set of nodes already connected to offspring (avoid duplicates)
-        """
-        if L >= R:
-            return
-        
-        if visited is None:
-            visited = set()
-        if connected is None:
-            connected = set()
-        
-        if node_id in visited:
-            return
+        if node_id in visited: return
         visited.add(node_id)
         
-        # Get mutations and coverage info
-        all_muts = self._get_node_mutations(node_id)
-        relevant_muts = self._get_mutations_in_interval(node_id, L, R)
-        
-        all_mut_ids = set(mut_id for mut_id, _ in all_muts)
-        relevant_mut_ids = set(mut_id for mut_id, _ in relevant_muts)
+        # 1. Get ONLY the range indices (O(log M))
+        left, right = self._get_mutation_range(node_id, L, R)
+        num_rel = right - left
+        num_all = len(self._pos_cache.get(node_id, []))
 
-        # Check mutation relevance
-        has_all_relevant = (relevant_mut_ids == all_mut_ids) and len(all_mut_ids) > 0
-        has_no_relevant = len(relevant_mut_ids) == 0
-        has_partial_relevant = len(relevant_mut_ids) > 0 and relevant_mut_ids != all_mut_ids
+        has_all_relevant = (num_all > 0) and (num_rel == num_all)
+        has_no_relevant = (num_rel == 0)
+        has_partial_relevant = (num_rel > 0) and (num_rel < num_all)
         
-        # Get ancestral coverage
         Iu = self._get_ancestral_coverage(node_id)
         
-        if self.debug_mode:
-            print(f"Visiting node {node_id}: all_muts={all_mut_ids}, relevant_muts={relevant_mut_ids}, Iu={Iu}")
-        
-        # Determine coverage status
+        # Scenario: Root / Terminal Node
         if Iu is None:
-            if self.debug_mode:
-                print("No ancestral mutations - treating as root node")
             if has_all_relevant:
-                if self.debug_mode:
-                    print("Root Node Case 1: All relevant mutations - connect directly")
-                # if (node_id not in connected and
-                #     not self._has_connected_descendant(node_id, connected)):
                 if node_id not in connected:
                     self.grg.connect(node_id, -offspring_id)
                     connected.add(node_id)
-
-                    # Remove sample status if connecting an original sample node to avoid confusion with new offspring samples
-                    current_samples = list(self.grg.get_sample_nodes())
-                    if node_id in current_samples:
-                        current_samples.remove(node_id)
-                        self.grg.set_samples(current_samples)
-
-                elif self.debug_mode:
-                    print(f"Node {node_id} already connected or has connected relatives, skipping direct connection")
+                    self._pending_sample_removals.add(node_id)
             
             if has_partial_relevant:
-                if self.debug_mode:
-                    print("Root Node Case 2: Partial relevant mutations - create bubble and connect")
-                bubble_id = self._extract_bubble(node_id, list(relevant_mut_ids), 
-                                                        offspring_id, (L, R))
+                # ONLY NOW do we extract the IDs for the bubble
+                rel_mut_ids = [m[0] for m in self._mutation_cache[node_id][left:right]]
+                bubble_id = self._extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
                 connected.add(bubble_id)
-                # connected.add(node_id)
-            
-            return # Stop - lineage fully resolved
-
+            return
         
         # Check if disjoint (Pruning - Scenario 2)
         # I ∩ Iu = ∅
-        ancestral_disjoint = R < Iu[0] or L > Iu[1]
+        ancestral_disjoint = R <= Iu[0] or L >= Iu[1]
 
         # Check interval coverage
         full_coverage = (Iu[0] >= L and Iu[1] <= R)  # Iu ⊆ I (node is fully consumed)
@@ -348,11 +514,14 @@ class NonDuplicationRecombination:
                 self.grg.connect(node_id, -offspring_id)
                 connected.add(node_id)
 
+                # Queue sample removal instead of crossing into C++ immediately
+                self._pending_sample_removals.add(node_id)
+
                 # Remove sample status if connecting an original sample node to avoid confusion with new offspring samples
-                current_samples = list(self.grg.get_sample_nodes())
-                if node_id in current_samples:
-                    current_samples.remove(node_id)
-                    self.grg.set_samples(current_samples)
+                # current_samples = list(self.grg.get_sample_nodes())
+                # if node_id in current_samples:
+                #     current_samples.remove(node_id)
+                #     self.grg.set_samples(current_samples)
 
             elif self.debug_mode:
                 print(f"Node {node_id} already connected or has connected relatives, skipping direct connection")
@@ -386,9 +555,15 @@ class NonDuplicationRecombination:
             if self.debug_mode:
                 print("Case 4: Partial/full relevant mutations - need to create bubble and maybe recurse upwards")
             # Cases where we have relevant mutations (partial or full) but not full coverage - need to create bubble and maybe recurse upwards
-            bubble_id = self._extract_bubble(node_id, list(relevant_mut_ids), 
-                                                    offspring_id, (L, R))
+            
+            # Generate the list of IDs ONLY if a bubble is actually needed
+            rel_mut_ids = [m[0] for m in self._mutation_cache[node_id][left:right]]
+            bubble_id = self._extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
             connected.add(bubble_id)
+            
+            # bubble_id = self._extract_bubble(node_id, list(relevant_mut_ids), 
+            #                                         offspring_id, (L, R))
+            # connected.add(bubble_id)
             # connected.add(node_id)  # Treat split node as covered to avoid connecting ancestors
 
             if not ancestral_disjoint:
@@ -405,39 +580,70 @@ class NonDuplicationRecombination:
             
             return
     
-    def _apply_pending_bubbles(self):
-        """Apply all deferred bubble modifications after traversal completes.
+    # def _apply_pending_bubbles(self):
+    #     """Apply all deferred bubble modifications after traversal completes.
         
-        This batches all mutation movements and ensures the graph structure
-        remains stable during traversal, avoiding cascading cache invalidations.
-        """
+    #     This batches all mutation movements and ensures the graph structure
+    #     remains stable during traversal, avoiding cascading cache invalidations.
+    #     """
+    #     for bubble_op in self._pending_bubbles:
+    #         node_id = bubble_op['node_id']
+    #         bubble_id = bubble_op['bubble_id']
+    #         relevant_mut_ids = bubble_op['relevant_mut_ids']
+            
+    #         # Move relevant mutations from node to bubble (Algorithm 3: v.M <- Mrel; u.M <- u.M \ Mrel)
+    #         for mut_id in relevant_mut_ids:
+    #             mut = self.grg.get_mutation_by_id(mut_id)
+                
+    #             # Add mutation to bubble node
+    #             self.grg.add_mutation(mut, bubble_id)
+    #             # Remove mutation from original node
+    #             self.grg.remove_mutation(mut_id, node_id)
+        
+    #     # Clear the queue
+    #     self._pending_bubbles.clear()
+
+    def _apply_pending_bubbles(self):
+        """Apply all deferred bubble modifications and sample removals after traversal."""
         for bubble_op in self._pending_bubbles:
             node_id = bubble_op['node_id']
             bubble_id = bubble_op['bubble_id']
             relevant_mut_ids = bubble_op['relevant_mut_ids']
             
-            # Move relevant mutations from node to bubble (Algorithm 3: v.M <- Mrel; u.M <- u.M \ Mrel)
             for mut_id in relevant_mut_ids:
                 mut = self.grg.get_mutation_by_id(mut_id)
-                
-                # Add mutation to bubble node
                 self.grg.add_mutation(mut, bubble_id)
-                # Remove mutation from original node
                 self.grg.remove_mutation(mut_id, node_id)
         
-        # Clear the queue
         self._pending_bubbles.clear()
+
+        # NEW: Process pending sample removals in one single fast batch
+        if self._pending_sample_removals:
+            current_samples = set(self.grg.get_sample_nodes())
+            current_samples.difference_update(self._pending_sample_removals)
+            self.grg.set_samples(list(current_samples))
+            self._pending_sample_removals.clear()
     
-    def _clear_modified_caches(self):
-        """Clear only the caches for nodes that were modified during recombination.
+    # def _clear_modified_caches(self):
+    #     """Clear only the caches for nodes that were modified during recombination.
         
-        This is much more efficient than clearing all caches, as most nodes in a large
-        graph are unmodified and their cached data remains valid for the next offspring.
-        """
+    #     This is much more efficient than clearing all caches, as most nodes in a large
+    #     graph are unmodified and their cached data remains valid for the next offspring.
+    #     """
+    #     for node_id in self._modified_nodes:
+    #         self._mutation_cache.pop(node_id, None)
+    #         self._span_cache.pop(node_id, None)
+    #         self._ancestral_coverage_cache.pop(node_id, None)
+    #     self._modified_nodes.clear()
+    #     self._precompute_spans_iteratively()  # Recompute spans for modified nodes and their ancestors
+
+    def _clear_modified_caches(self):
         for node_id in self._modified_nodes:
             self._mutation_cache.pop(node_id, None)
-            self._span_cache.pop(node_id, None)
-            self._ancestral_coverage_cache.pop(node_id, None)
+            self._pos_cache.pop(node_id, None) # Clear the position cache too!
+            if node_id < len(self.span_cache):
+                self.span_cache[node_id] = False
+                self.anc_cov_cache[node_id] = False
         self._modified_nodes.clear()
     
     def recombine(self, haplotype_A, haplotype_B, breakpoint):
@@ -475,6 +681,9 @@ class NonDuplicationRecombination:
         
         # Apply all deferred bubble modifications after traversal completes
         self._apply_pending_bubbles()
+
+        # NEW: Clear caches and rebuild DP arrays for the next generation
+        self._clear_modified_caches()
         
         #self.grg.bp_range = self.original_bp_range  # Ensure bp_range is updated to reflect the full genome length
         
@@ -516,6 +725,9 @@ class NonDuplicationRecombination:
         # Apply all deferred bubble modifications after traversal completes
         # This prevents mid-traversal cache invalidations and keeps the graph stable
         self._apply_pending_bubbles()
+
+        # NEW: Clear caches and rebuild DP arrays for the next generation
+        self._clear_modified_caches()
         
         #self.grg.bp_range = self.original_bp_range  # Ensure bp_range is updated to reflect the full genome length
         
