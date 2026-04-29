@@ -21,6 +21,7 @@ from dataclasses import dataclass, asdict
 import pygrgl
 import re
 import psutil
+import cProfile, pstats
 
 # Import our custom modules (ensure these are in the same directory)
 from grg_recombination import simulate_grg_recombination, NonDuplicationRecombination
@@ -308,7 +309,11 @@ class RecombinationBenchmarker:
                 # Run GRG recombination for this generation
                 if debug:
                     print(f"\n    [Gen {gen+1}] Simulating generation {gen+1} with GRG recombination...")
+                pr = cProfile.Profile()
+                pr.enable()
                 offspring_ids, gen_bp = simulate_grg_recombination(self, recomb, base_genome, N=base_genome[1])
+                pr.disable()
+                pstats.Stats(pr).sort_stats('cumtime').print_stats(25)  # Print top 25 cumulative time functions
                 total_grg_bp += gen_bp
                 if debug:
                     print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_grg_bp}")
