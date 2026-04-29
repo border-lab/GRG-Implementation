@@ -195,7 +195,7 @@ class RecombinationBenchmarker:
 
     def run_benchmarks(self):
         self.print_header()
-        
+
         # 1. Use pathlib to find the files (returns real Path objects, not strings!)
         if self.grg_dir.is_dir():
             grg_files = list(self.grg_dir.glob("*.grg"))
@@ -215,11 +215,17 @@ class RecombinationBenchmarker:
             print(f"  {f.name}")
         print("=" * 80)
 
+        # Set base csv output filename prefix (we'll append file-specific suffix if benchmark is run on 1 file)
+        filename_prefix = "benchmark_recombination_results"
+        if len(grg_files) == 1:
+            # If only one file, include its name in the output filename prefix for clarity
+            filename_prefix += f"_{grg_files[0].stem}"
+
         for file_path in grg_files:
             # file_path is a real Path object, so _benchmark_file will accept it perfectly!
             self._benchmark_file(file_path)
             
-            self.save_results(self.output_dir)
+            self.save_results(self.output_dir, filename_prefix)
             print(f"[*] Checkpoint saved! Results safely written to disk.")
         return self.results
 
@@ -310,11 +316,11 @@ class RecombinationBenchmarker:
                 # Run GRG recombination for this generation
                 if debug:
                     print(f"\n    [Gen {gen+1}] Simulating generation {gen+1} with GRG recombination...")
-                pr = cProfile.Profile()
-                pr.enable()
+                # pr = cProfile.Profile()
+                # pr.enable()
                 offspring_ids, gen_bp = simulate_grg_recombination(self, recomb, base_genome, N=base_genome[1])
-                pr.disable()
-                pstats.Stats(pr).sort_stats('cumtime').print_stats(25)  # Print top 25 cumulative time functions
+                # pr.disable()
+                # pstats.Stats(pr).sort_stats('cumtime').print_stats(25)  # Print top 25 cumulative time functions
                 total_grg_bp += gen_bp
                 if debug:
                     print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_grg_bp}")
@@ -523,10 +529,10 @@ class RecombinationBenchmarker:
         # print(f"  Memory Footprint: {est_mb:.1f} MB dense matrix allocated")
 
 
-    def save_results(self, output_dir: Path):
+    def save_results(self, output_dir: Path, filename_prefix: str = "benchmark_recombination_results"):
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        csv_path = output_dir / "benchmark_recombination_results.csv"
+        csv_path = output_dir / f"{filename_prefix}.csv"
         with open(csv_path, 'w', newline='') as f:
             if not self.results: return
             writer = csv.DictWriter(f, fieldnames=asdict(self.results[0]).keys())
@@ -534,7 +540,7 @@ class RecombinationBenchmarker:
             for res in self.results:
                 writer.writerow(asdict(res))
                 
-        json_path = output_dir / "benchmark_recombination_results.json"
+        json_path = output_dir / f"{filename_prefix}.json"
         with open(json_path, 'w') as f:
             json.dump({
                 "system_info": asdict(self.system_info),
@@ -572,4 +578,3 @@ if __name__ == "__main__":
     )
     
     benchmarker.run_benchmarks()
-    benchmarker.save_results(args.output_dir)
