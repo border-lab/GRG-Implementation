@@ -5,53 +5,7 @@ Optimized core module containing the Non-duplication GRG recombination algorithm
 """
 
 import bisect
-
 import numpy as np
-
-# def get_breakpoints(N, expected_crossovers=1.5):
-#     num_bp = np.random.poisson(expected_crossovers)
-#     if num_bp == 0:
-#         return np.array([], dtype=int)
-#     num_bp = min(num_bp, N - 1)
-#     bp = np.random.choice(range(1, N), size=num_bp, replace=False)
-#     bp.sort()
-#     return bp
-
-# def recombination_intervals(h1, h2, N, expected_crossovers=1.5):
-#     bp = get_breakpoints(N, expected_crossovers)
-#     start = np.random.binomial(1, 0.5, 1)[0]
-#     parents = [h1, h2]
-
-#     segments = []
-#     for i, K in enumerate(bp):
-#         segments.append((parents[(start + i) % 2], K))
-#     segments.append((parents[(start + len(bp)) % 2], N))
-#     return segments
-
-
-def get_breakpoints(bp_range, expected_crossovers=1.5):
-    num_bp = np.random.poisson(expected_crossovers)
-    if num_bp == 0:
-        return np.array([], dtype=int)
-
-    low, high = bp_range  # assuming exclusive low and high
-    length = high - low + 1
-    num_bp = min(num_bp, length)
-
-    # Oversample a bit, then deduplicate
-    k = num_bp * 3  # oversampling factor; small, since num_bp is tiny
-    candidates = np.random.randint(low + 1, high, size=k)
-    unique = np.unique(candidates)
-
-    if unique.size < num_bp:
-        # Very unlikely with small num_bp, but handle just in case
-        extra_needed = num_bp - unique.size
-        extra = np.random.randint(low + 1, high, size=extra_needed * 3)
-        unique = np.unique(np.concatenate([unique, extra]))
-
-    bp = np.sort(unique[:num_bp])
-    return bp
-
 
 def recombination_intervals(h1, h2, bp, N):
     """
@@ -780,9 +734,10 @@ class NonDuplicationRecombination:
         return -(self.NEGATIVE_NODE_IDS.index(offspring_id) + 1)
 
 
-def simulate_grg_recombination(recomb, bp_range, N):
+def simulate_grg_recombination(benchmark, recomb, bp_range, N):
     # recombiner = NonDuplicationRecombination(grg)
 
+    total_bp = 0
     samples = np.array(recomb.grg.get_sample_nodes())
     np.random.shuffle(samples)
 
@@ -793,8 +748,9 @@ def simulate_grg_recombination(recomb, bp_range, N):
         p2 = samples[i + 1]
 
         for j in range(2):
-            bp = get_breakpoints(bp_range, expected_crossovers=1.5)
+            bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers=1.5)
             segments = recombination_intervals(p1, p2, bp, N)
+            total_bp += num_bp
 
             # Clear only caches for nodes that were modified in the previous offspring.
             # This preserves cache data for the ~95% of nodes that weren't touched,
@@ -808,4 +764,4 @@ def simulate_grg_recombination(recomb, bp_range, N):
     new_offspring_ids.sort()
     recomb.grg.set_samples(new_offspring_ids)
 
-    return new_offspring_ids
+    return new_offspring_ids, total_bp

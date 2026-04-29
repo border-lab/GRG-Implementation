@@ -104,35 +104,13 @@ def grg_to_numpy_parallel(g, n_jobs=4):
     
     return genotype_matrix.T
 
-def get_breakpoints(bp_range, expected_crossovers=1.5):
-    num_bp = np.random.poisson(expected_crossovers)
-    if num_bp == 0:
-        return np.array([], dtype=int)
-
-    low, high = bp_range            # inclusive or exclusive? assuming inclusive high here
-    length = high - low + 1
-    num_bp = min(num_bp, length)
-
-    # Oversample a bit, then deduplicate
-    k = num_bp * 3                  # oversampling factor; small, since num_bp is tiny
-    candidates = np.random.randint(low, high + 1, size=k)
-    unique = np.unique(candidates)
-
-    if unique.size < num_bp:
-        # Very unlikely with small num_bp, but handle just in case
-        extra_needed = num_bp - unique.size
-        extra = np.random.randint(low, high + 1, size=extra_needed * 3)
-        unique = np.unique(np.concatenate([unique, extra]))
-
-    bp = np.sort(unique[:num_bp])
-    return bp
-
-def simulate_numpy_recombination(genotype_matrix, bp_range,expected_crossovers=1.5):
+def simulate_numpy_recombination(benchmark, genotype_matrix, bp_range, expected_crossovers=1.5):
     """
     Performs true recombination using standard NumPy array slicing.
     Each parent mates exactly once, and each pair produces 2 children.
     """
     num_samples, genome_length = genotype_matrix.shape
+    total_bp = 0
     
     # Calculate exact offspring count (handles odd numbers safely by flooring pairs)
     num_pairs = num_samples // 2
@@ -155,8 +133,9 @@ def simulate_numpy_recombination(genotype_matrix, bp_range,expected_crossovers=1
         # Each pair produces 2 children
         for j in range(4):
             if offspring_idx >= num_offspring:
-                return offspring_matrix
-            bp = get_breakpoints(bp_range, expected_crossovers)
+                return offspring_matrix, total_bp
+            bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers)
+            total_bp += num_bp
             # print("testcase breakpoints:", offspring_idx, j)  # Debug print for breakpoints
             # bp = testcases[offspring_idx][j] # Use pre-generated breakpoints for consistency
             current_parent = p1 if np.random.random() < 0.5 else p2
@@ -172,6 +151,6 @@ def simulate_numpy_recombination(genotype_matrix, bp_range,expected_crossovers=1
             offspring_idx += 1
         
         if offspring_idx >= num_offspring:
-            return offspring_matrix
+            return offspring_matrix, total_bp
             
-    return offspring_matrix
+    return offspring_matrix, total_bp

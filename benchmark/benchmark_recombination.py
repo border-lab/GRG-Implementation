@@ -35,28 +35,28 @@ def get_process_memory_mb():
     # rss = Resident Set Size (the actual RAM used)
     return process.memory_info().rss / (1024 * 1024)
 
-def get_breakpoints(bp_range, expected_crossovers=1.5):
-    num_bp = np.random.poisson(expected_crossovers)
-    if num_bp == 0:
-        return np.array([], dtype=int)
+# def get_breakpoints(bp_range, expected_crossovers=1.5):
+#     num_bp = np.random.poisson(expected_crossovers)
+#     if num_bp == 0:
+#         return np.array([], dtype=int)
 
-    low, high = bp_range            # inclusive or exclusive? assuming inclusive high here
-    length = high - low + 1
-    num_bp = min(num_bp, length)
+#     low, high = bp_range            # inclusive or exclusive? assuming inclusive high here
+#     length = high - low + 1
+#     num_bp = min(num_bp, length)
 
-    # Oversample a bit, then deduplicate
-    k = num_bp * 3                  # oversampling factor; small, since num_bp is tiny
-    candidates = np.random.randint(low, high + 1, size=k)
-    unique = np.unique(candidates)
+#     # Oversample a bit, then deduplicate
+#     k = num_bp * 3                  # oversampling factor; small, since num_bp is tiny
+#     candidates = np.random.randint(low, high + 1, size=k)
+#     unique = np.unique(candidates)
 
-    if unique.size < num_bp:
-        # Very unlikely with small num_bp, but handle just in case
-        extra_needed = num_bp - unique.size
-        extra = np.random.randint(low, high + 1, size=extra_needed * 3)
-        unique = np.unique(np.concatenate([unique, extra]))
+#     if unique.size < num_bp:
+#         # Very unlikely with small num_bp, but handle just in case
+#         extra_needed = num_bp - unique.size
+#         extra = np.random.randint(low, high + 1, size=extra_needed * 3)
+#         unique = np.unique(np.concatenate([unique, extra]))
 
-    bp = np.sort(unique[:num_bp])
-    return bp
+#     bp = np.sort(unique[:num_bp])
+#     return bp
 
 
 def recombination_intervals(h1, h2, bp, N):
@@ -83,6 +83,8 @@ class BenchmarkResult:
     num_samples_initial: int
     num_snps: int
     num_runs: int
+    num_bp: float
+    mean_bp: float
     mean_time_ms: float
     std_time_ms: float
     min_time_ms: float
@@ -165,6 +167,29 @@ class RecombinationBenchmarker:
         print(f"Memory limit: {self.memory_limit_mb} MB")
         print("=" * 80)
 
+    def get_breakpoints(self, bp_range, expected_crossovers=1.5):
+        num_bp = np.random.poisson(expected_crossovers)
+        if num_bp == 0:
+            return np.array([], dtype=int), num_bp
+
+        low, high = bp_range  # assuming exclusive low and high
+        length = high - low + 1
+        num_bp = min(num_bp, length)
+
+        # Oversample a bit, then deduplicate
+        k = num_bp * 3  # oversampling factor; small, since num_bp is tiny
+        candidates = np.random.randint(low + 1, high, size=k)
+        unique = np.unique(candidates)
+
+        if unique.size < num_bp:
+            # Very unlikely with small num_bp, but handle just in case
+            extra_needed = num_bp - unique.size
+            extra = np.random.randint(low + 1, high, size=extra_needed * 3)
+            unique = np.unique(np.concatenate([unique, extra]))
+
+        bp = np.sort(unique[:num_bp])
+        return bp, num_bp
+
     def run_benchmarks(self):
         self.print_header()
         
@@ -234,11 +259,12 @@ class RecombinationBenchmarker:
         # run numpy recombination
         # repeat steps 1-3 for num_runs and num_warmup
 
-        print("\n Generating Base NumPy Population Matrix...")
+        print(f"\nGenerating Base NumPy Population Matrix...")
         base_numpy_population_matrix = grg_to_numpy_parallel(pygrgl.load_mutable_grg(str(file_path)))
 
         grg_times = []
         grg_sizes = []
+        grg_size_changes = []
         numpy_times = []
         nodes_added = 0
 
@@ -275,16 +301,20 @@ class RecombinationBenchmarker:
             print(f"\nStarting GRG Recombination Benchmarking...")
             if debug:
                 print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with GRG recombination...")
+            total_grg_bp = 0
             start = time.perf_counter()
             recomb = NonDuplicationRecombination(g)
             for gen in range(self.num_generations):
                 # Run GRG recombination for this generation
                 if debug:
-                    print(f"  [Run {gen+1}] Simulating generation {gen+1} with GRG recombination...")
-                offspring_ids = simulate_grg_recombination(recomb, base_genome, N=base_genome[1])
+                    print(f"\n    [Gen {gen+1}] Simulating generation {gen+1} with GRG recombination...")
+                offspring_ids, gen_bp = simulate_grg_recombination(self, recomb, base_genome, N=base_genome[1])
+                total_grg_bp += gen_bp
+                if debug:
+                    print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_grg_bp}")
             elapsed = time.perf_counter() - start
             if debug:
-                print(f"  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
+                print(f"\n  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
             
             if i >= self.num_warmup:
                 grg_times.append(elapsed * 1000)  # Convert to ms
@@ -295,7 +325,8 @@ class RecombinationBenchmarker:
             
             gc.collect()
             mem_after = get_process_memory_mb()
-            grg_sizes.append(mem_after - mem_before)
+            grg_sizes.append(mem_after)
+            grg_size_changes.append(mem_after - mem_before)
             print(f"  [Run {i+1}] Memory usage: {mem_after:.1f} MB (Delta: +{mem_after - mem_before:.1f} MB)")
             del g
             del recomb
@@ -307,30 +338,37 @@ class RecombinationBenchmarker:
                 if debug:
                     print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with NumPy recombination...")
                 offspring_matrix = base_numpy_population_matrix.copy()
+                total_numpy_bp = 0
                 start = time.perf_counter()
                 for gen in range(self.num_generations):
                     # Run NumPy recombination for this generation
                     if debug:
-                        print(f"  [Run {gen+1}] Simulating generation {gen+1} with NumPy recombination...")
-                    offspring_matrix = simulate_numpy_recombination(offspring_matrix, base_genome)
+                        print(f"\n    [Gen {gen+1}] Simulating generation {gen+1} with NumPy recombination...")
+                    offspring_matrix, gen_bp = simulate_numpy_recombination(self, offspring_matrix, base_genome)
+                    total_numpy_bp += gen_bp
+                    if debug:
+                        print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_numpy_bp}")
                 elapsed = time.perf_counter() - start
                 if debug:
-                    print(f"  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
+                    print(f"\n  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
                 if i >= self.num_warmup:
                     numpy_times.append(elapsed * 1000)  # Convert to ms
         
-        grg_mean, grg_std, grg_sizes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes)
+        grg_mean, grg_std, grg_sizes_mean, grg_size_changes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes), np.mean(grg_size_changes)
+        grg_bp_mean = total_grg_bp / (self.num_runs * self.num_generations)
         if not skip_numpy:
             numpy_mean, numpy_std = np.mean(numpy_times), np.std(numpy_times)
+            numpy_bp_mean = total_numpy_bp / (self.num_runs * self.num_generations)
         actual_offspring_generated = (base_samples // 2) * 2
 
         self.results.append(BenchmarkResult(
             file=file_path.name, num_offspring=actual_offspring_generated,
             implementation="GRG Native", num_samples_initial=base_samples,
             num_snps=base_mutations, num_runs=self.num_runs,
+            num_bp=total_grg_bp, mean_bp=grg_bp_mean,
             mean_time_ms=grg_mean, std_time_ms=grg_std,
             min_time_ms=np.min(grg_times), max_time_ms=np.max(grg_times),
-            nodes_added=nodes_added, memory_mb=grg_sizes_mean
+            nodes_added=nodes_added, memory_mb=grg_sizes_mean,
         ))
 
         if not skip_numpy:
@@ -338,20 +376,24 @@ class RecombinationBenchmarker:
                 file=file_path.name, num_offspring=self.num_offspring,
                 implementation="NumPy Baseline", num_samples_initial=base_samples,
                 num_snps=base_mutations, num_runs=self.num_runs,
+                num_bp=total_numpy_bp, mean_bp=numpy_bp_mean,
                 mean_time_ms=numpy_mean, std_time_ms=numpy_std,
                 min_time_ms=np.min(numpy_times), max_time_ms=np.max(numpy_times),
                 nodes_added=0, memory_mb=est_mb
             ))
 
-        print(f"\nResults for {file_path.name}:")
+        print(f"\nResults for {file_path.name}:\n")
 
         print(f"  GRG Native:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
         print(f"  Space Delta:    +{nodes_added} nodes created")
-        print(f"  Memory Delta:   +{grg_sizes_mean:.1f} MB (GRG recombination memory increase)")
+        print(f"  GRG Breakpoints: {grg_bp_mean:.2f} average breakpoints per generation")
+        print(f"  GRG Memory:     {grg_sizes_mean:.1f} MB average resident memory")
+        print(f"  Memory Delta:   +{grg_size_changes_mean:.1f} MB (GRG recombination memory increase), ")
         print()
 
         if not skip_numpy:
             print(f"  NumPy Baseline: {numpy_mean:.2f}ms ± {numpy_std:.2f}ms")
+            print(f"  NumPy Breakpoints: {numpy_bp_mean:.2f} average breakpoints per generation")
             if grg_mean > 0:
                 speedup = numpy_mean / grg_mean
                 print(f"  Speedup:        {speedup:.2f}x (NumPy / GRG)")
