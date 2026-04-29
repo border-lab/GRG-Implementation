@@ -106,6 +106,7 @@ class RecombinationBenchmarker:
     def __init__(
         self,
         grg_files_dir: Path,
+        output_dir: Path,
         num_warmup: int = 1,
         num_runs: int = 3,
         num_offspring: int = 100,
@@ -114,6 +115,7 @@ class RecombinationBenchmarker:
         include_numpy: bool = True
     ):
         self.grg_dir = grg_files_dir
+        self.output_dir = output_dir
         self.num_warmup = num_warmup
         self.num_runs = num_runs
         self.num_offspring = num_offspring
@@ -213,12 +215,11 @@ class RecombinationBenchmarker:
             print(f"  {f.name}")
         print("=" * 80)
 
-        output_path = Path("./output")
         for file_path in grg_files:
             # file_path is a real Path object, so _benchmark_file will accept it perfectly!
             self._benchmark_file(file_path)
             
-            self.save_results(output_path)
+            self.save_results(self.output_dir)
             print(f"[*] Checkpoint saved! Results safely written to disk.")
         return self.results
 
@@ -551,17 +552,18 @@ class RecombinationBenchmarker:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GRG Recombination Benchmarker")
     parser.add_argument("--grg-dir", type=Path, default=Path("./grg_files"), help="Directory with GRG files")
+    parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory to save benchmark results")
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs (default: 1)")
     parser.add_argument("--runs", type=int, default=3, help="Timed runs (default: 3)")
     parser.add_argument("--offspring", type=int, default=100, help="Number of sequential recombinations per batch (default: 100)")
     parser.add_argument("--num-generations", type=int, default=2, help="Number of sequential recombination generations to simulate (default: 2)")
     parser.add_argument("--memory-limit", type=float, default=15000.0, help="Memory limit in MB (default: 15000)")
-    parser.add_argument("--output-dir", type=Path, default=Path("."), help="Output directory")
     
     args = parser.parse_args()
     
     benchmarker = RecombinationBenchmarker(
         grg_files_dir=args.grg_dir,
+        output_dir=args.output_dir,
         num_warmup=args.warmup,
         num_runs=args.runs,
         num_offspring=args.offspring,
