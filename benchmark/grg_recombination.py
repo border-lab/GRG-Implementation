@@ -12,8 +12,7 @@ def recombination_intervals(h1, h2, bp, N):
     Returns list of segments: [(source_parent_id, end_coord), ...]
     """
     # bp = self.get_breakpoints(N)
-    # start = np.random.binomial(1, 0.5, 1)[0]
-    start = h1
+    start = np.random.binomial(1, 0.5, 1)[0]
     parents = [h1, h2]
 
     segments = []
