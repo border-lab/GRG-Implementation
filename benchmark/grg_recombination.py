@@ -423,7 +423,7 @@ def simulate_grg_recombination(benchmark, recomb, bp_range, N):
             p1 = samples[i]
             p2 = samples[i + 1]
 
-            for j in range(2):
+            for j in range(benchmark.num_offspring_per_couple):
                 bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers=1.5)
                 segments = recombination_intervals(p1, p2, bp, N)
                 total_bp += num_bp

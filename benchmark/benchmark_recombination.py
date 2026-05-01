@@ -109,7 +109,7 @@ class RecombinationBenchmarker:
         output_dir: Path,
         num_warmup: int = 1,
         num_runs: int = 3,
-        num_offspring: int = 100,
+        num_offspring_per_couple: int = 2,
         num_generations: int = 2,
         memory_limit_mb: float = 15000.0,
         include_numpy: bool = True
@@ -118,7 +118,8 @@ class RecombinationBenchmarker:
         self.output_dir = output_dir
         self.num_warmup = num_warmup
         self.num_runs = num_runs
-        self.num_offspring = num_offspring
+        self.num_offspring_per_couple = num_offspring_per_couple
+        self.num_couples = None  # will be determined per file based on num_samples
         self.num_generations = num_generations
         self.memory_limit_mb = memory_limit_mb
         self.include_numpy = include_numpy
@@ -166,7 +167,7 @@ class RecombinationBenchmarker:
         print(f"CPU Cores: {self.system_info.cpu_count}")
         print(f"NumPy: {self.system_info.numpy_version}")
         print(f"Warmup runs: {self.num_warmup}, Timed runs: {self.num_runs}")
-        print(f"Offspring per batch: {self.num_offspring}")
+        print(f"Offspring per couple: {self.num_offspring_per_couple}")
         print(f"Memory limit: {self.memory_limit_mb} MB")
         print("=" * 80)
 
@@ -242,13 +243,14 @@ class RecombinationBenchmarker:
         base_nodes = g_base.num_nodes
         base_genome = g_base.bp_range
         base_couples = base_samples // 2
+        self.num_couples = base_couples
         
         print(f" Genome (bp): {base_genome}")
         print(f" Couples: {base_couples} (from {base_samples} samples)")
 
         # Estimate memory for the POST-recombination NumPy array
         # It will have (base_samples + num_offspring) columns
-        est_mb = estimate_numpy_memory(base_mutations, base_samples + self.num_offspring)
+        est_mb = estimate_numpy_memory(base_mutations, base_samples + self.num_offspring_per_couple * base_couples)
 
         skip_numpy = False
         if est_mb > self.memory_limit_mb:
@@ -371,7 +373,7 @@ class RecombinationBenchmarker:
         if not skip_numpy:
             numpy_mean, numpy_std = np.mean(numpy_times), np.std(numpy_times)
             numpy_bp_mean = total_numpy_bp / (self.num_runs * self.num_generations)
-        actual_offspring_generated = (base_samples // 2) * 2
+        actual_offspring_generated = self.num_couples * self.num_offspring_per_couple * self.num_generations
 
         self.results.append(BenchmarkResult(
             file=file_path.name, num_offspring=actual_offspring_generated,
@@ -385,7 +387,7 @@ class RecombinationBenchmarker:
 
         if not skip_numpy:
             self.results.append(BenchmarkResult(
-                file=file_path.name, num_offspring=self.num_offspring,
+                file=file_path.name, num_offspring= actual_offspring_generated,
                 implementation="NumPy Baseline", num_samples_initial=base_samples,
                 num_snps=base_mutations, num_runs=self.num_runs,
                 num_bp=total_numpy_bp, mean_bp=numpy_bp_mean,
@@ -547,7 +549,7 @@ class RecombinationBenchmarker:
                 "config": {
                     "warmup_runs": self.num_warmup,
                     "timed_runs": self.num_runs,
-                    "num_offspring": self.num_offspring,
+                    "num_offspring": self.num_offspring_per_couple * self.num_couples * self.num_generations,
                     "memory_limit_mb": self.memory_limit_mb
                 },
                 "results": [asdict(r) for r in self.results]
@@ -561,7 +563,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory to save benchmark results")
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs (default: 1)")
     parser.add_argument("--runs", type=int, default=3, help="Timed runs (default: 3)")
-    parser.add_argument("--offspring", type=int, default=100, help="Number of sequential recombinations per batch (default: 100)")
+    parser.add_argument("--offspring-per-couple", type=int, default=2, help="Number of sequential recombinations per couple in generation (default: 2)")
     parser.add_argument("--num-generations", type=int, default=2, help="Number of sequential recombination generations to simulate (default: 2)")
     parser.add_argument("--memory-limit", type=float, default=15000.0, help="Memory limit in MB (default: 15000)")
     
@@ -572,7 +574,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         num_warmup=args.warmup,
         num_runs=args.runs,
-        num_offspring=args.offspring,
+        num_offspring_per_couple=args.offspring_per_couple,
         num_generations=args.num_generations,
         memory_limit_mb=args.memory_limit
     )

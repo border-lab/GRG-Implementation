@@ -131,7 +131,7 @@ def simulate_numpy_recombination(benchmark, genotype_matrix, bp_range, expected_
         p2 = parent_indices[i+1]
         
         # Each pair produces 2 children
-        for j in range(2):
+        for j in range(benchmark.num_offspring_per_couple):
             if offspring_idx >= num_offspring:
                 return offspring_matrix, total_bp
             bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers)
