@@ -104,53 +104,107 @@ def grg_to_numpy_parallel(g, n_jobs=4):
     
     return genotype_matrix.T
 
+
+def _fill_one_offspring_alternating(matrix, p1, p2, bp, dest_row, dest, shuffle_start_parent):
+    """One offspring: shared ``bp``; alternate p1/p2 along segments (random start if True)."""
+    if shuffle_start_parent:
+        current = p1 if np.random.random() < 0.5 else p2
+    else:
+        current = p1
+    other = p2 if current == p1 else p1
+    start_idx = 0
+    for b in bp:
+        dest[dest_row, start_idx:b] = matrix[current, start_idx:b]
+        start_idx = b
+        current, other = other, current
+    dest[dest_row, start_idx:] = matrix[current, start_idx:]
+
+
+def _fill_shared_breakpoints_k_offspring(matrix, p1, p2, bp, k, row_base, dest):
+    """
+    One shared breakpoint set per couple. For each segment, sibling rows partition the
+    two parents: slot ``(j + segment_index + phase) % k`` maps to p1 if
+    ``slot < k // 2`` else p2, with random ``phase`` in ``[0, k)`` per couple.
+
+    For k==2 this is complementary offspring (no duplicate parental segment assignment);
+    for larger k, each segment splits offspring between p1 and p2 as evenly as
+    possible (floor(k/2) vs ceil(k/2)), rotated along the chromosome.
+
+    k==1 uses alternating segments along the shared breakpoints only (single gamete).
+    """
+    genome_length = matrix.shape[1]
+    bp = np.asarray(bp, dtype=int)
+
+    if k == 1:
+        _fill_one_offspring_alternating(
+            matrix, p1, p2, bp, row_base, dest, shuffle_start_parent=True
+        )
+        return
+
+    phase = np.random.randint(0, k)
+    half = k // 2
+    segment_starts = [0] + [int(x) for x in bp]
+    segment_ends = list(bp) + [genome_length]
+    num_segments = len(segment_starts)
+
+    for s in range(num_segments):
+        a, bnd = segment_starts[s], segment_ends[s]
+        if a >= bnd:
+            continue
+        for j in range(k):
+            slot = (j + s + phase) % k
+            parent = p1 if slot < half else p2
+            dest[row_base + j, a:bnd] = matrix[parent, a:bnd]
+
+
 def simulate_numpy_recombination(benchmark, genotype_matrix, bp_range, expected_crossovers=1.5):
     """
-    Performs true recombination using standard NumPy array slicing.
-    Each parent mates exactly once, and each pair produces 2 children.
+    Recombination on a dense (samples x loci) matrix.
+
+    Each mating pair uses **one** ``get_breakpoints`` draw per pair. All siblings from
+    that pair share the same crossover positions; within each segment, offspring rows
+    partition inheritance between the two parents (rotating assignment along segments)
+    so segment sources do not overlap redundantly across siblings the way independent
+    per-offspring draws would.
+
+    ``total_bp`` sums ``num_bp`` from that single draw per couple.
     """
     num_samples, genome_length = genotype_matrix.shape
     total_bp = 0
-    
-    # Calculate exact offspring count (handles odd numbers safely by flooring pairs)
+
     num_pairs = num_samples // 2
-    num_offspring = num_pairs * 2
-    # print(f"Simulating recombination for {num_samples} samples ({num_pairs} pairs) to produce {num_offspring} offspring.")
-    
+    k = getattr(benchmark, "num_offspring_per_couple", 2)
+    num_offspring = num_pairs * k
+
     offspring_matrix = np.zeros((num_offspring, genome_length), dtype=genotype_matrix.dtype)
-    
-    # Shuffle parent indices for random pairing
+
     parent_indices = np.arange(num_samples)
     np.random.shuffle(parent_indices)
-    
+
     offspring_idx = 0
-    
-    # Iterate through pairs
+
     for i in range(0, num_samples - 1, 2):
         p1 = parent_indices[i]
-        p2 = parent_indices[i+1]
-        
-        # Each pair produces 2 children
-        for j in range(benchmark.num_offspring_per_couple):
-            if offspring_idx >= num_offspring:
-                return offspring_matrix, total_bp
-            bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers)
-            total_bp += num_bp
-            # print("testcase breakpoints:", offspring_idx, j)  # Debug print for breakpoints
-            # bp = testcases[offspring_idx][j] # Use pre-generated breakpoints for consistency
-            current_parent = p1 if np.random.random() < 0.5 else p2
-            other_parent = p2 if current_parent == p1 else p1
-            
-            start_idx = 0
-            for b in bp:
-                offspring_matrix[offspring_idx, start_idx:b] = genotype_matrix[current_parent, start_idx:b]
-                start_idx = b
-                current_parent, other_parent = other_parent, current_parent
-                
-            offspring_matrix[offspring_idx, start_idx:] = genotype_matrix[current_parent, start_idx:]
-            offspring_idx += 1
-        
+        p2 = parent_indices[i + 1]
+
+        if offspring_idx + k > num_offspring:
+            return offspring_matrix, total_bp
+
+        bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers)
+        total_bp += num_bp
+
+        _fill_shared_breakpoints_k_offspring(
+            genotype_matrix,
+            p1,
+            p2,
+            bp,
+            k,
+            offspring_idx,
+            offspring_matrix,
+        )
+        offspring_idx += k
+
         if offspring_idx >= num_offspring:
             return offspring_matrix, total_bp
-            
+
     return offspring_matrix, total_bp

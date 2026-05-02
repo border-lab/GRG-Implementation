@@ -168,6 +168,11 @@ class RecombinationBenchmarker:
         print(f"NumPy: {self.system_info.numpy_version}")
         print(f"Warmup runs: {self.num_warmup}, Timed runs: {self.num_runs}")
         print(f"Offspring per couple: {self.num_offspring_per_couple}")
+        if self.include_numpy:
+            print(
+                "NumPy baseline: grg_numpy_baseline.simulate_numpy_recombination "
+                "(one breakpoint draw per couple; sibling rows partition p1/p2 per segment)"
+            )
         print(f"Memory limit: {self.memory_limit_mb} MB")
         print("=" * 80)
 
@@ -241,11 +246,12 @@ class RecombinationBenchmarker:
         base_samples = g_base.num_samples
         base_mutations = g_base.num_mutations
         base_nodes = g_base.num_nodes
+        # Shared physical interval for breakpoint draws (GRG + NumPy baseline).
         base_genome = g_base.bp_range
         base_couples = base_samples // 2
         self.num_couples = base_couples
         
-        print(f" Genome (bp): {base_genome}")
+        print(f" Genome (bp_range for recombination): {base_genome}")
         print(f" Couples: {base_couples} (from {base_samples} samples)")
 
         # Estimate memory for the POST-recombination NumPy array
@@ -358,7 +364,14 @@ class RecombinationBenchmarker:
                     # Run NumPy recombination for this generation
                     if debug:
                         print(f"\n    [Gen {gen+1}] Simulating generation {gen+1} with NumPy recombination...")
-                    offspring_matrix, gen_bp = simulate_numpy_recombination(self, offspring_matrix, base_genome)
+                    # self provides get_breakpoints(bp_range, ...) and num_offspring_per_couple
+                    # (see grg_numpy_baseline.simulate_numpy_recombination).
+                    offspring_matrix, gen_bp = simulate_numpy_recombination(
+                        self,
+                        offspring_matrix,
+                        bp_range=base_genome,
+                        expected_crossovers=1.5,
+                    )
                     total_numpy_bp += gen_bp
                     if debug:
                         print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_numpy_bp}")
@@ -407,7 +420,10 @@ class RecombinationBenchmarker:
 
         if not skip_numpy:
             print(f"  NumPy Baseline: {numpy_mean:.2f}ms ± {numpy_std:.2f}ms")
-            print(f"  NumPy Breakpoints: {numpy_bp_mean:.2f} average breakpoints per generation")
+            print(
+                f"  NumPy Breakpoints: {numpy_bp_mean:.2f} mean total breakpoint count per generation "
+                f"(one draw per mating couple)"
+            )
             if grg_mean > 0:
                 speedup = numpy_mean / grg_mean
                 print(f"  Speedup:        {speedup:.2f}x (NumPy / GRG)")
@@ -563,7 +579,12 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory to save benchmark results")
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs (default: 1)")
     parser.add_argument("--runs", type=int, default=3, help="Timed runs (default: 3)")
-    parser.add_argument("--offspring-per-couple", type=int, default=2, help="Number of sequential recombinations per couple in generation (default: 2)")
+    parser.add_argument(
+        "--offspring-per-couple",
+        type=int,
+        default=2,
+        help="Offspring rows produced per mating couple each generation (NumPy: one shared breakpoint draw per couple; default: 2)",
+    )
     parser.add_argument("--num-generations", type=int, default=2, help="Number of sequential recombination generations to simulate (default: 2)")
     parser.add_argument("--memory-limit", type=float, default=15000.0, help="Memory limit in MB (default: 15000)")
     
