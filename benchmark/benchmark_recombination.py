@@ -21,14 +21,18 @@ from dataclasses import dataclass, asdict
 import pygrgl
 import re
 import psutil
-import cProfile, pstats
 
 # Import our custom modules (ensure these are in the same directory)
-from grg_recombination import simulate_grg_recombination, NonDuplicationRecombination
+from grg_recombination import (
+    simulate_grg_recombination,
+    NonDuplicationRecombination,
+    compute_grg_structural_stats,
+)
 from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
 
 # DEBUG Mode
 debug = True
+
 
 def get_process_memory_mb():
     """Returns the current process memory usage in MB."""
@@ -240,7 +244,7 @@ class RecombinationBenchmarker:
         exp_inds, exp_snps = self._parse_expected_size(file_path.name)
         if exp_inds and exp_snps:
             print(f" Expected: {exp_inds} individuals, {exp_snps} SNPs")
-            
+
         # Load once just to get base stats
         g_base = pygrgl.load_mutable_grg(str(file_path))
         base_samples = g_base.num_samples
@@ -250,9 +254,27 @@ class RecombinationBenchmarker:
         base_genome = g_base.bp_range
         base_couples = base_samples // 2
         self.num_couples = base_couples
-        
+
         print(f" Genome (bp_range for recombination): {base_genome}")
         print(f" Couples: {base_couples} (from {base_samples} samples)")
+
+        # ---- Structural stats (one-shot, before any recombination) ----
+        print("\nComputing structural stats...")
+        struct_t0 = time.perf_counter()
+        structural_stats = compute_grg_structural_stats(g_base)
+        print(f"  done in {time.perf_counter() - struct_t0:.2f}s")
+        for key in ("num_nodes", "num_edges", "num_samples", "num_mutations",
+                    "num_roots", "internal_per_sample", "genome_length"):
+            print(f"  {key:25s} {structural_stats[key]}")
+        for key in ("mutations_per_node", "up_fanout", "sample_depth"):
+            s = structural_stats[key]
+            if s.get("count", 0):
+                print(f"  {key:25s} mean={s['mean']:.2f} p50={s['p50']} p95={s['p95']} max={s['max']}")
+        # File the structural stats away on the instance keyed by filename
+        # so save_results() picks them up.
+        if not hasattr(self, "diagnostics"):
+            self.diagnostics = {}
+        self.diagnostics[file_path.name] = {"structural": structural_stats}
 
         # Estimate memory for the POST-recombination NumPy array
         # It will have (base_samples + num_offspring) columns
@@ -265,7 +287,7 @@ class RecombinationBenchmarker:
 
         print(f" Actual Base: {base_samples} samples, {base_mutations} mutations, {base_nodes} nodes")
         print(f" Estimated memory for NumPy array (post-recomb): {est_mb:.1f} MB")
-        
+
         # Free base graph
         del g_base
         gc.collect()
@@ -380,7 +402,50 @@ class RecombinationBenchmarker:
                     print(f"\n  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
                 if i >= self.num_warmup:
                     numpy_times.append(elapsed * 1000)  # Convert to ms
-        
+
+        # ----- Diagnostic pass with full instrumentation -----
+        # One additional GRG run with `instrument=True` so we capture phase
+        # breakdowns, C++ call costs (esp. add_mutation / remove_mutation),
+        # and per-offspring + per-bubble distributions per generation.
+        # Wallclock here is NOT used for the headline numbers above.
+        print(f"\nRunning instrumented diagnostic pass...")
+        diag_g = pygrgl.load_mutable_grg(str(file_path))
+        diag_recomb = NonDuplicationRecombination(diag_g, instrument=True)
+        per_generation_stats = []
+        diag_total_start = time.perf_counter()
+        for gen in range(self.num_generations):
+            print(f"  [Diag] Generation {gen+1}/{self.num_generations}...")
+            diag_recomb.reset_stats()
+            gen_start = time.perf_counter()
+            simulate_grg_recombination(self, diag_recomb, base_genome, N=base_genome[1])
+            gen_elapsed = time.perf_counter() - gen_start
+            snapshot = dict(diag_recomb.stats)
+            snapshot["generation_index"] = gen
+            snapshot["generation_wallclock_s"] = gen_elapsed
+            snapshot["num_nodes_after_gen"] = diag_g.num_nodes
+            per_generation_stats.append(snapshot)
+            print(f"    wallclock={gen_elapsed:.2f}s "
+                  f"offspring={snapshot['offspring_count']} "
+                  f"bubbles={snapshot['bubbles_created']} "
+                  f"muts_moved={snapshot['mutations_moved']} "
+                  f"visits={snapshot['visits_total']}")
+            if snapshot["remove_mutation_calls"]:
+                rm_us = snapshot["remove_mutation_time"] / snapshot["remove_mutation_calls"] * 1e6
+                print(f"    remove_mutation per-call: {rm_us:.2f} us "
+                      f"(total {snapshot['remove_mutation_time']:.2f}s "
+                      f"over {snapshot['remove_mutation_calls']:,} calls)")
+            if snapshot["add_mutation_calls"]:
+                am_us = snapshot["add_mutation_time"] / snapshot["add_mutation_calls"] * 1e6
+                print(f"    add_mutation per-call:    {am_us:.2f} us")
+        diag_total = time.perf_counter() - diag_total_start
+        print(f"  Diagnostic pass total: {diag_total:.2f}s")
+        del diag_g, diag_recomb
+        gc.collect()
+
+        # Stash per-generation snapshots on the diagnostic record for this file.
+        self.diagnostics.setdefault(file_path.name, {})["per_generation"] = per_generation_stats
+        self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
+
         grg_mean, grg_std, grg_sizes_mean, grg_size_changes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes), np.mean(grg_size_changes)
         grg_bp_mean = total_grg_bp / (self.num_runs * self.num_generations)
         if not skip_numpy:
@@ -566,11 +631,14 @@ class RecombinationBenchmarker:
                     "warmup_runs": self.num_warmup,
                     "timed_runs": self.num_runs,
                     "num_offspring": self.num_offspring_per_couple * self.num_couples * self.num_generations,
-                    "memory_limit_mb": self.memory_limit_mb
+                    "memory_limit_mb": self.memory_limit_mb,
+                    "num_generations": self.num_generations,
+                    "num_offspring_per_couple": self.num_offspring_per_couple,
                 },
-                "results": [asdict(r) for r in self.results]
+                "results": [asdict(r) for r in self.results],
+                "diagnostics": getattr(self, "diagnostics", {}),
             }, f, indent=2)
-            
+
         print(f"\nResults saved to {csv_path} and {json_path}")
 
 if __name__ == "__main__":

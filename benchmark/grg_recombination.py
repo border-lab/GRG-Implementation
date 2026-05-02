@@ -5,7 +5,66 @@ Optimized core module containing the Non-duplication GRG recombination algorithm
 """
 
 import bisect
+import time
+from collections import deque
+
 import numpy as np
+
+
+def _summary(xs):
+    """min/mean/p50/p95/p99/max for a list of numbers (or {'count': 0} if empty)."""
+    if not xs:
+        return {"count": 0}
+    xs_sorted = sorted(xs)
+    m = len(xs_sorted)
+    return {
+        "count": m,
+        "min": xs_sorted[0],
+        "max": xs_sorted[-1],
+        "mean": sum(xs_sorted) / m,
+        "p50": xs_sorted[m // 2],
+        "p95": xs_sorted[min(m - 1, int(m * 0.95))],
+        "p99": xs_sorted[min(m - 1, int(m * 0.99))],
+    }
+
+
+def compute_grg_structural_stats(grg):
+    """One-shot graph topology metrics; safe to run before recombination.
+    O(V + E) plus sorts for distribution summaries."""
+    n = grg.num_nodes
+    samples = [i for i in range(n) if grg.is_sample(i)]
+    roots = list(grg.get_root_nodes())
+
+    # Topological depth via BFS down from roots.
+    depth = {r: 0 for r in roots}
+    queue = deque(roots)
+    while queue:
+        node = queue.popleft()
+        d = depth[node]
+        for child in grg.get_down_edges(node):
+            cd = depth.get(child, -1)
+            if cd < d + 1:
+                depth[child] = d + 1
+                queue.append(child)
+    sample_depths = [depth.get(s, 0) for s in samples]
+
+    mut_counts = [len(grg.get_mutations_for_node(i)) for i in range(n)]
+    up_fanouts = [len(grg.get_up_edges(i)) for i in range(n)]
+    down_fanouts = [len(grg.get_down_edges(i)) for i in range(n)]
+
+    return {
+        "num_nodes": n,
+        "num_edges": grg.num_edges,
+        "num_samples": len(samples),
+        "num_mutations": grg.num_mutations,
+        "num_roots": len(roots),
+        "internal_per_sample": (n - len(samples)) / max(1, len(samples)),
+        "genome_length": grg.bp_range[1],
+        "mutations_per_node": _summary(mut_counts),
+        "up_fanout": _summary(up_fanouts),
+        "down_fanout": _summary(down_fanouts),
+        "sample_depth": _summary(sample_depths),
+    }
 
 def recombination_intervals(h1, h2, bp, N):
     """
@@ -45,7 +104,7 @@ class NonDuplicationRecombination:
 
     debug_mode = False
 
-    def __init__(self, grg):
+    def __init__(self, grg, instrument=False):
         self.grg = grg
         self.genome_length = grg.bp_range[1]
         self.original_bp_range = grg.bp_range
@@ -68,6 +127,48 @@ class NonDuplicationRecombination:
         self._connected_gen = [0] * self.grg.num_nodes
         self._gen_visited = 0
         self._gen_connected = 0
+
+        # ----- Instrumentation -----
+        # When True, every public recombine call accumulates phase / C++-call
+        # timings and per-offspring + per-bubble distributions into self.stats.
+        # Overhead per moved mutation is ~150 ns (3 perf_counter calls) -- well
+        # below 0.1% on the workloads we care about.
+        self.instrument = instrument
+        self.stats = self._fresh_stats()
+
+    @staticmethod
+    def _fresh_stats():
+        return {
+            # Phase-level wallclock totals (seconds)
+            "recurse_attach_time": 0.0,
+            "apply_bubbles_time": 0.0,
+            "sync_to_grg_time": 0.0,
+            "clear_caches_time": 0.0,
+            "flush_samples_time": 0.0,
+            # C++-call wallclock totals (seconds)
+            "get_mutation_by_id_time": 0.0,
+            "add_mutation_time": 0.0,
+            "remove_mutation_time": 0.0,
+            "make_node_time": 0.0,
+            "connect_time": 0.0,
+            # C++-call counts (per_call_cost = time / count)
+            "get_mutation_by_id_calls": 0,
+            "add_mutation_calls": 0,
+            "remove_mutation_calls": 0,
+            "make_node_calls": 0,
+            "connect_calls": 0,
+            # Algorithmic counters
+            "offspring_count": 0,
+            "recurse_attach_calls": 0,
+            "segments_processed": 0,
+            "visits_total": 0,
+            "bubbles_created": 0,
+            "mutations_moved": 0,
+        }
+
+    def reset_stats(self):
+        """Clear instrumentation accumulators (e.g. between generations)."""
+        self.stats = self._fresh_stats()
 
     # ------------------------------------------------------------------
     # Per-node array growth
@@ -186,11 +287,23 @@ class NonDuplicationRecombination:
     # ------------------------------------------------------------------
 
     def _extract_bubble(self, node_id, relevant_mut_ids, offspring_id, interval):
+        instrument = self.instrument
+        if instrument:
+            t = time.perf_counter()
         bubble_id = self.grg.make_node()
+        if instrument:
+            self.stats["make_node_time"] += time.perf_counter() - t
+            self.stats["make_node_calls"] += 1
+
         self._grow_node_arrays(bubble_id)
 
+        if instrument:
+            t = time.perf_counter()
         self.grg.connect(bubble_id, node_id)
         self.grg.connect(bubble_id, -offspring_id)
+        if instrument:
+            self.stats["connect_time"] += time.perf_counter() - t
+            self.stats["connect_calls"] += 2
 
         # node_id just gained a new up-edge; drop its cached up-edges list.
         self._up_edges_cache.pop(node_id, None)
@@ -329,26 +442,67 @@ class NonDuplicationRecombination:
     # ------------------------------------------------------------------
 
     def _apply_pending_bubbles(self):
+        instrument = self.instrument
+        if instrument:
+            t_apply_start = time.perf_counter()
+            t_get = 0.0
+            t_add = 0.0
+            t_rem = 0.0
+            n_bubbles = len(self._pending_bubbles)
+            n_muts_total = 0
+
         for bubble_op in self._pending_bubbles:
             node_id = bubble_op['node_id']
             bubble_id = bubble_op['bubble_id']
-            for mut_id in bubble_op['relevant_mut_ids']:
+            muts = bubble_op['relevant_mut_ids']
+            if instrument:
+                n_muts_total += len(muts)
+            for mut_id in muts:
+                if instrument:
+                    t = time.perf_counter()
                 mut = self.grg.get_mutation_by_id(mut_id)
+                if instrument:
+                    t_get += time.perf_counter() - t
+                    t = time.perf_counter()
                 self.grg.add_mutation(mut, bubble_id)
+                if instrument:
+                    t_add += time.perf_counter() - t
+                    t = time.perf_counter()
                 self.grg.remove_mutation(mut_id, node_id)
+                if instrument:
+                    t_rem += time.perf_counter() - t
         self._pending_bubbles.clear()
 
         if not self.defer_sample_updates:
             self.flush_sample_updates()
 
+        if instrument:
+            elapsed = time.perf_counter() - t_apply_start
+            self.stats["apply_bubbles_time"] += elapsed
+            self.stats["get_mutation_by_id_time"] += t_get
+            self.stats["add_mutation_time"] += t_add
+            self.stats["remove_mutation_time"] += t_rem
+            self.stats["get_mutation_by_id_calls"] += n_muts_total
+            self.stats["add_mutation_calls"] += n_muts_total
+            self.stats["remove_mutation_calls"] += n_muts_total
+            self.stats["bubbles_created"] += n_bubbles
+            self.stats["mutations_moved"] += n_muts_total
+
     def flush_sample_updates(self):
         if self._pending_sample_removals:
+            instrument = self.instrument
+            if instrument:
+                t = time.perf_counter()
             current = set(self.grg.get_sample_nodes())
             current.difference_update(self._pending_sample_removals)
             self.grg.set_samples(list(current))
             self._pending_sample_removals.clear()
+            if instrument:
+                self.stats["flush_samples_time"] += time.perf_counter() - t
 
     def _clear_modified_caches(self):
+        if self.instrument:
+            t = time.perf_counter()
         for node_id in self._modified_nodes:
             self._mutation_cache.pop(node_id, None)
             self._pos_cache.pop(node_id, None)
@@ -356,6 +510,8 @@ class NonDuplicationRecombination:
                 self.span_cache[node_id] = False
                 self.anc_cov_cache[node_id] = False
         self._modified_nodes.clear()
+        if self.instrument:
+            self.stats["clear_caches_time"] += time.perf_counter() - t
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -370,37 +526,96 @@ class NonDuplicationRecombination:
         return -(idx + 1)
 
     def recombine(self, haplotype_A, haplotype_B, breakpoint):
+        instrument = self.instrument
         self._pending_bubbles.clear()
+
+        if instrument:
+            t = time.perf_counter()
+            gen_v_before = self._gen_visited
         self._sync_to_grg()
+        if instrument:
+            self.stats["sync_to_grg_time"] += time.perf_counter() - t
+            t = time.perf_counter()
         offspring_id = self.grg.make_node(negative=True)
+        if instrument:
+            self.stats["make_node_time"] += time.perf_counter() - t
+            self.stats["make_node_calls"] += 1
         self._grow_node_arrays(self.grg.num_nodes - 1)
         self._gen_connected += 1
 
+        if instrument:
+            recurse_t = 0.0
+            ts = time.perf_counter()
         self._recurse_attach(haplotype_A, offspring_id, 0, breakpoint)
+        if instrument:
+            recurse_t += time.perf_counter() - ts
+            self.stats["recurse_attach_calls"] += 1
+            self.stats["segments_processed"] += 1
+            ts = time.perf_counter()
         self._recurse_attach(haplotype_B, offspring_id, breakpoint, self.genome_length)
+        if instrument:
+            recurse_t += time.perf_counter() - ts
+            self.stats["recurse_attach_calls"] += 1
+            self.stats["segments_processed"] += 1
+            self.stats["recurse_attach_time"] += recurse_t
 
         self._apply_pending_bubbles()
         self._clear_modified_caches()
 
+        if instrument:
+            gen_v_after = self._gen_visited
+            gen_set = set(range(gen_v_before + 1, gen_v_after + 1))
+            v = sum(1 for x in self._visited_gen if x in gen_set)
+            self.stats["visits_total"] += v
+            self.stats["offspring_count"] += 1
+
         return self._register_offspring(offspring_id)
 
     def recombine_multi(self, segments):
+        instrument = self.instrument
         self._pending_bubbles.clear()
+
+        if instrument:
+            t = time.perf_counter()
+            gen_v_before = self._gen_visited
         self._sync_to_grg()
+        if instrument:
+            self.stats["sync_to_grg_time"] += time.perf_counter() - t
+            t = time.perf_counter()
         offspring_id = self.grg.make_node(negative=True)
+        if instrument:
+            self.stats["make_node_time"] += time.perf_counter() - t
+            self.stats["make_node_calls"] += 1
         self._grow_node_arrays(self.grg.num_nodes - 1)
         self._gen_connected += 1
 
+        if instrument:
+            recurse_t = 0.0
         start = 0
         for parent_id, end in segments:
             if end > start:
                 if self.debug_mode:
                     print("BREAK")
+                if instrument:
+                    ts = time.perf_counter()
                 self._recurse_attach(parent_id, offspring_id, start, end)
+                if instrument:
+                    recurse_t += time.perf_counter() - ts
+                    self.stats["recurse_attach_calls"] += 1
+                    self.stats["segments_processed"] += 1
             start = end
+        if instrument:
+            self.stats["recurse_attach_time"] += recurse_t
 
         self._apply_pending_bubbles()
         self._clear_modified_caches()
+
+        if instrument:
+            gen_v_after = self._gen_visited
+            gen_set = set(range(gen_v_before + 1, gen_v_after + 1))
+            v = sum(1 for x in self._visited_gen if x in gen_set)
+            self.stats["visits_total"] += v
+            self.stats["offspring_count"] += 1
 
         return self._register_offspring(offspring_id)
 
