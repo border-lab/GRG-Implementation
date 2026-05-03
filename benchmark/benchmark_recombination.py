@@ -304,7 +304,7 @@ class RecombinationBenchmarker:
         grg_sizes = []
         grg_size_changes = []
         numpy_times = []
-        nodes_added = 0
+        total_nodes_added = 0
 
         for i in range(self.num_warmup + self.num_runs):
 
@@ -362,8 +362,8 @@ class RecombinationBenchmarker:
                 grg_times.append(elapsed * 1000)  # Convert to ms
 
             # Grab node count on the last run for space complexity metrics
-            if i == (self.num_warmup + self.num_runs - 1):
-                nodes_added = g.num_nodes - base_nodes
+            if i >= self.num_warmup:
+                total_nodes_added += g.num_nodes - base_nodes
             
             gc.collect()
             mem_after = get_process_memory_mb()
@@ -452,6 +452,7 @@ class RecombinationBenchmarker:
             numpy_mean, numpy_std = np.mean(numpy_times), np.std(numpy_times)
             numpy_bp_mean = total_numpy_bp / (self.num_runs * self.num_generations)
         actual_offspring_generated = self.num_couples * self.num_offspring_per_couple * self.num_generations
+        nodes_added_per_run = total_nodes_added / self.num_runs
 
         self.results.append(BenchmarkResult(
             file=file_path.name, num_offspring=actual_offspring_generated,
@@ -460,7 +461,7 @@ class RecombinationBenchmarker:
             num_bp=total_grg_bp, mean_bp=grg_bp_mean,
             mean_time_ms=grg_mean, std_time_ms=grg_std,
             min_time_ms=np.min(grg_times), max_time_ms=np.max(grg_times),
-            nodes_added=nodes_added, memory_mb=grg_sizes_mean,
+            nodes_added=nodes_added_per_run, memory_mb=grg_sizes_mean,
         ))
 
         if not skip_numpy:
@@ -477,7 +478,7 @@ class RecombinationBenchmarker:
         print(f"\nResults for {file_path.name}:\n")
 
         print(f"  GRG Native:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
-        print(f"  Space Delta:    +{nodes_added} nodes created")
+        print(f"  Space Delta:    +{nodes_added_per_run:.2f} nodes created per run on average")
         print(f"  GRG Breakpoints: {grg_bp_mean:.2f} average breakpoints per generation")
         print(f"  GRG Memory:     {grg_sizes_mean:.1f} MB average resident memory")
         print(f"  Memory Delta:   +{grg_size_changes_mean:.1f} MB (GRG recombination memory increase), ")
