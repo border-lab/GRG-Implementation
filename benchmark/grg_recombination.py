@@ -100,6 +100,11 @@ class NonDuplicationRecombination:
     - `_extract_bubble` no longer invalidates the caches of node_id's
       parents; bubble extraction does not affect their span or ancestral
       coverage, so invalidation just thrashes high-traffic cache entries.
+    - Per-parent interval batching: `recombine_multi` groups all segments
+      contributed by the same parent into a single traversal whose query
+      is the union of those intervals. This avoids re-bubbling the same
+      ancestor when one parent contributes mutations across multiple
+      disjoint segments of the offspring's genome.
     """
 
     debug_mode = False
@@ -227,6 +232,48 @@ class NonDuplicationRecombination:
         return bisect.bisect_left(positions, L), bisect.bisect_left(positions, R)
 
     # ------------------------------------------------------------------
+    # Interval-union helpers
+    # ------------------------------------------------------------------
+    # `intervals` is always a sorted tuple of disjoint, coalesced,
+    # half-open (L, R) pairs representing the union of genomic regions
+    # the offspring still needs to inherit on the current traversal.
+
+    @staticmethod
+    def _intervals_disjoint_from(intervals, lo, hi):
+        for L, R in intervals:
+            if L >= hi:
+                return True
+            if R > lo:
+                return False
+        return True
+
+    @staticmethod
+    def _intervals_contain(intervals, lo, hi):
+        # True iff some single piece (L_i, R_i) of the union has
+        # L_i <= lo and hi <= R_i. Because the pieces are disjoint and
+        # coalesced, no half-open [lo, hi) can be covered by spanning
+        # multiple pieces -- coalescing collapses adjacency.
+        for L, R in intervals:
+            if L > lo:
+                return False
+            if R >= hi:
+                return True
+        return False
+
+    @staticmethod
+    def _clip_intervals(intervals, lo, hi):
+        result = []
+        for L, R in intervals:
+            if R <= lo:
+                continue
+            if L >= hi:
+                break
+            nL = L if L > lo else lo
+            nR = R if R < hi else hi
+            result.append((nL, nR))
+        return tuple(result)
+
+    # ------------------------------------------------------------------
     # Iterative span / ancestral coverage
     # ------------------------------------------------------------------
 
@@ -286,7 +333,7 @@ class NonDuplicationRecombination:
     # Bubble extraction
     # ------------------------------------------------------------------
 
-    def _extract_bubble(self, node_id, relevant_mut_ids, offspring_id, interval):
+    def _extract_bubble(self, node_id, relevant_mut_ids, offspring_id, intervals):
         instrument = self.instrument
         if instrument:
             t = time.perf_counter()
@@ -328,7 +375,11 @@ class NonDuplicationRecombination:
     # Iterative recurse-attach (hot path)
     # ------------------------------------------------------------------
 
-    def _recurse_attach(self, root_id, offspring_id, L0, R0):
+    def _recurse_attach(self, root_id, offspring_id, intervals):
+        """`intervals`: sorted, coalesced tuple of disjoint half-open (L, R) pairs."""
+        if not intervals:
+            return
+
         self._gen_visited += 1
         gen_v = self._gen_visited
         gen_c = self._gen_connected
@@ -346,37 +397,43 @@ class NonDuplicationRecombination:
         get_ancestral_coverage = self._get_ancestral_coverage
         get_up_edges_cached = self._get_up_edges_cached
         extract_bubble = self._extract_bubble
+        clip_intervals = NonDuplicationRecombination._clip_intervals
         grg_connect = self.grg.connect
         pending_sample_removals_add = self._pending_sample_removals.add
 
         neg_offspring = -offspring_id
-        stack = [(root_id, L0, R0)]
+        stack = [(root_id, intervals)]
         stack_append = stack.append
         stack_pop = stack.pop
 
         while stack:
-            node_id, L, R = stack_pop()
+            node_id, ivs = stack_pop()
 
-            if L >= R:
+            if not ivs:
                 continue
             if visited_gen[node_id] == gen_v:
                 continue
             visited_gen[node_id] = gen_v
 
-            # Inlined _get_mutation_range + _get_node_mutations cache-hit path.
+            # Multi-bisect over each piece of the union; collect both the
+            # count of relevant mutations and the (left, right) slice
+            # bounds (only used if we end up extracting a bubble).
             positions = pos_cache.get(node_id)
             if positions is None:
                 get_node_mutations(node_id)              # populates both caches
                 positions = pos_cache[node_id]
 
-            if positions:
-                left = bisect_left(positions, L)
-                right = bisect_left(positions, R)
-            else:
-                left = right = 0
-
-            num_rel = right - left
             num_all = len(positions)
+            num_rel = 0
+            slice_bounds = None
+            if num_all:
+                slice_bounds = []
+                for L, R in ivs:
+                    left = bisect_left(positions, L)
+                    right = bisect_left(positions, R)
+                    if right > left:
+                        slice_bounds.append((left, right))
+                        num_rel += right - left
 
             has_all_relevant = num_all > 0 and num_rel == num_all
             has_no_relevant = num_rel == 0
@@ -393,15 +450,36 @@ class NonDuplicationRecombination:
                     connected_gen[node_id] = gen_c
                     pending_sample_removals_add(node_id)
                 if has_partial_relevant:
-                    rel_mut_ids = [m[0] for m in mutation_cache[node_id][left:right]]
-                    bubble_id = extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
+                    muts = mutation_cache[node_id]
+                    rel_mut_ids = []
+                    for l, r in slice_bounds:
+                        rel_mut_ids.extend(m[0] for m in muts[l:r])
+                    bubble_id = extract_bubble(node_id, rel_mut_ids, offspring_id, ivs)
                     connected_gen[bubble_id] = gen_c
                 continue
 
             Iu0 = Iu[0]
             Iu1 = Iu[1]
-            ancestral_disjoint = R <= Iu0 or L >= Iu1
-            full_coverage = Iu0 >= L and Iu1 <= R
+
+            # ancestral_disjoint: no piece of the union overlaps [Iu0, Iu1).
+            ancestral_disjoint = True
+            for L, R in ivs:
+                if L >= Iu1:
+                    break
+                if R > Iu0:
+                    ancestral_disjoint = False
+                    break
+
+            # full_coverage: some single piece of the union fully contains
+            # [Iu0, Iu1). Coalesced disjoint pieces can't cover [Iu0, Iu1)
+            # by spanning, so a single-piece check is sufficient.
+            full_coverage = False
+            for L, R in ivs:
+                if L > Iu0:
+                    break
+                if R >= Iu1:
+                    full_coverage = True
+                    break
 
             if has_all_relevant and full_coverage:
                 if connected_gen[node_id] != gen_c:
@@ -414,28 +492,27 @@ class NonDuplicationRecombination:
                 continue
 
             if has_no_relevant:
-                # Inline max/min — Python's builtins are surprisingly slow
-                # at this call rate (showed up at ~50ms in the profile).
-                newL = L if L > Iu0 else Iu0
-                newR = R if R < Iu1 else Iu1
-                if newL >= newR:
+                clipped = clip_intervals(ivs, Iu0, Iu1)
+                if not clipped:
                     continue
                 for parent in reversed(get_up_edges_cached(node_id)):
-                    stack_append((parent, newL, newR))
+                    stack_append((parent, clipped))
                 continue
 
             # Partial / all relevant, not full coverage -> bubble + maybe recurse.
-            rel_mut_ids = [m[0] for m in mutation_cache[node_id][left:right]]
-            bubble_id = extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
+            muts = mutation_cache[node_id]
+            rel_mut_ids = []
+            for l, r in slice_bounds:
+                rel_mut_ids.extend(m[0] for m in muts[l:r])
+            bubble_id = extract_bubble(node_id, rel_mut_ids, offspring_id, ivs)
             connected_gen[bubble_id] = gen_c
 
             if not ancestral_disjoint:
-                newL = L if L > Iu0 else Iu0
-                newR = R if R < Iu1 else Iu1
-                if newL >= newR:
+                clipped = clip_intervals(ivs, Iu0, Iu1)
+                if not clipped:
                     continue
                 for parent in reversed(get_up_edges_cached(node_id)):
-                    stack_append((parent, newL, newR))
+                    stack_append((parent, clipped))
 
     # ------------------------------------------------------------------
     # Apply deferred work, evict caches
@@ -546,13 +623,13 @@ class NonDuplicationRecombination:
         if instrument:
             recurse_t = 0.0
             ts = time.perf_counter()
-        self._recurse_attach(haplotype_A, offspring_id, 0, breakpoint)
+        self._recurse_attach(haplotype_A, offspring_id, ((0, breakpoint),))
         if instrument:
             recurse_t += time.perf_counter() - ts
             self.stats["recurse_attach_calls"] += 1
             self.stats["segments_processed"] += 1
             ts = time.perf_counter()
-        self._recurse_attach(haplotype_B, offspring_id, breakpoint, self.genome_length)
+        self._recurse_attach(haplotype_B, offspring_id, ((breakpoint, self.genome_length),))
         if instrument:
             recurse_t += time.perf_counter() - ts
             self.stats["recurse_attach_calls"] += 1
@@ -589,23 +666,46 @@ class NonDuplicationRecombination:
         self._grow_node_arrays(self.grg.num_nodes - 1)
         self._gen_connected += 1
 
-        if instrument:
-            recurse_t = 0.0
+        # Bucket segments by parent so each parent gets one traversal
+        # over the union of its contributed intervals. Avoids re-bubbling
+        # the same ancestor when one parent contributes mutations to two
+        # separated regions of the offspring's genome.
+        by_parent = {}
         start = 0
+        seg_count = 0
         for parent_id, end in segments:
             if end > start:
-                if self.debug_mode:
-                    print("BREAK")
-                if instrument:
-                    ts = time.perf_counter()
-                self._recurse_attach(parent_id, offspring_id, start, end)
-                if instrument:
-                    recurse_t += time.perf_counter() - ts
-                    self.stats["recurse_attach_calls"] += 1
-                    self.stats["segments_processed"] += 1
+                by_parent.setdefault(parent_id, []).append((start, end))
+                seg_count += 1
             start = end
+
+        if instrument:
+            recurse_t = 0.0
+        for parent_id, ivs in by_parent.items():
+            ivs.sort()
+            # Coalesce adjacent / overlapping intervals so the coverage
+            # checks in `_recurse_attach` (which assume coalesced input)
+            # remain correct. `recombination_intervals` produces strictly
+            # alternating segments so adjacency is rare, but selfing or
+            # odd breakpoint patterns can produce it.
+            merged = []
+            for L, R in ivs:
+                if merged and L <= merged[-1][1]:
+                    prev_L, prev_R = merged[-1]
+                    merged[-1] = (prev_L, R if R > prev_R else prev_R)
+                else:
+                    merged.append((L, R))
+            if self.debug_mode:
+                print(f"BREAK parent={parent_id} intervals={merged}")
+            if instrument:
+                ts = time.perf_counter()
+            self._recurse_attach(parent_id, offspring_id, tuple(merged))
+            if instrument:
+                recurse_t += time.perf_counter() - ts
+                self.stats["recurse_attach_calls"] += 1
         if instrument:
             self.stats["recurse_attach_time"] += recurse_t
+            self.stats["segments_processed"] += seg_count
 
         self._apply_pending_bubbles()
         self._clear_modified_caches()
