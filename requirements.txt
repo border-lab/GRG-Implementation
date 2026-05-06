@@ -1,0 +1,4 @@
+numpy==2.0.2
+packaging==26.2
+psutil==7.2.2
+tqdm==4.67.3

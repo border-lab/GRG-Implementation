@@ -150,6 +150,7 @@ class NonDuplicationRecombination:
             "sync_to_grg_time": 0.0,
             "clear_caches_time": 0.0,
             "flush_samples_time": 0.0,
+            "sort_mutations_time": 0.0,
             # C++-call wallclock totals (seconds)
             "get_mutation_by_id_time": 0.0,
             "add_mutation_time": 0.0,
@@ -214,7 +215,7 @@ class NonDuplicationRecombination:
 
     def _get_node_mutations(self, node_id):
         if node_id not in self._mutation_cache:
-            mut_ids = self.grg.get_mutations_for_node(node_id)
+            mut_ids = self.grg.get_mutations_for_node(node_id, allow_sort=False)
             mutations = []
             for mut_id in mut_ids:
                 mut = self.grg.get_mutation_by_id(mut_id)
@@ -784,6 +785,7 @@ class NonDuplicationRecombinationLegacy:
             "sync_to_grg_time": 0.0,
             "clear_caches_time": 0.0,
             "flush_samples_time": 0.0,
+            "sort_mutations_time": 0.0,
             # C++-call wallclock totals (seconds)
             "get_mutation_by_id_time": 0.0,
             "add_mutation_time": 0.0,
@@ -848,7 +850,7 @@ class NonDuplicationRecombinationLegacy:
 
     def _get_node_mutations(self, node_id):
         if node_id not in self._mutation_cache:
-            mut_ids = self.grg.get_mutations_for_node(node_id)
+            mut_ids = self.grg.get_mutations_for_node(node_id, allow_sort=False)
             mutations = []
             for mut_id in mut_ids:
                 mut = self.grg.get_mutation_by_id(mut_id)
@@ -1290,6 +1292,15 @@ def simulate_grg_recombination(benchmark, recomb, bp_range, N):
         recomb.grg.set_samples(new_offspring_ids)
         # Wholesale set_samples just made every accumulated removal moot.
         recomb._pending_sample_removals.clear()
+
+        # Compact soft-deleted mutation entries left behind by remove_mutation
+        # (now O(1) with the new API). Without this, get_mutations_for_node
+        # walks past the dead entries on every read at heavily-modified nodes.
+        if recomb.instrument:
+            t_sort = time.perf_counter()
+        recomb.grg.sort_mutations()
+        if recomb.instrument:
+            recomb.stats["sort_mutations_time"] += time.perf_counter() - t_sort
     finally:
         recomb.defer_sample_updates = prev_defer
 

@@ -5,11 +5,14 @@ benchmark/test_small
 # Ignore benchmark output
 benchmark/output
 
-# Ignore benchmark environment
+# Ignore all environments
 benchmark/.venv
+.venv
+
 
 # Ignore local grgl package
 benchmark/grgl
+grgl
 
 # Ignore benchmark zip
 benchmark/recombination_benchmark.zip
