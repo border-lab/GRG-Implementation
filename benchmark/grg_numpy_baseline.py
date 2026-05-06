@@ -43,7 +43,7 @@ def grg_to_numpy(g):
     genotype_matrix = np.zeros((g.num_mutations, g.num_samples), dtype=np.int8)
     
     # 4. Populate matrix
-    for node_id, mutation_id in g.get_node_mutation_pairs():
+    for node_id, mutation_id in g.get_node_mutation_pairs(allow_sort=False):
         # Only populate if the node actually has descendant samples
         if node_id in node_samples:
             for sample_node in node_samples[node_id]:
@@ -78,7 +78,7 @@ def grg_to_numpy_parallel(g, n_jobs=4):
                     visited.add(parent)
                     queue.append(parent)
     
-    mutation_pairs = list(g.get_node_mutation_pairs())
+    mutation_pairs = list(g.get_node_mutation_pairs(allow_sort=False))
     
     def process_chunk(chunk):
         rows, cols = [], []

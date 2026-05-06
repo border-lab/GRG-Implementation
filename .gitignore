@@ -7,9 +7,11 @@ benchmark/output
 
 # Ignore benchmark environment
 benchmark/.venv
+.venv
 
 # Ignore local grgl package
 benchmark/grgl
+grgl
 
 # Ignore benchmark zip
 benchmark/recombination_benchmark.zip
