@@ -415,11 +415,15 @@ class RecombinationBenchmarker:
         diag_total_start = time.perf_counter()
         for gen in range(self.num_generations):
             print(f"  [Diag] Generation {gen+1}/{self.num_generations}...")
-            diag_recomb.reset_stats()
+            diag_recomb.reset_stats()  # also resets audit
             gen_start = time.perf_counter()
             simulate_grg_recombination(self, diag_recomb, base_genome, N=base_genome[1])
             gen_elapsed = time.perf_counter() - gen_start
             snapshot = dict(diag_recomb.stats)
+            # ---- Audit 1: snapshot per-generation case histogram ----
+            # `dict(...)` makes a shallow copy so subsequent reset_stats()
+            # doesn't clobber the saved values.
+            snapshot["audit"] = dict(diag_recomb.audit)
             snapshot["generation_index"] = gen
             snapshot["generation_wallclock_s"] = gen_elapsed
             snapshot["num_nodes_after_gen"] = diag_g.num_nodes
@@ -439,11 +443,28 @@ class RecombinationBenchmarker:
                 print(f"    add_mutation per-call:    {am_us:.2f} us")
         diag_total = time.perf_counter() - diag_total_start
         print(f"  Diagnostic pass total: {diag_total:.2f}s")
+
+        # ---- Audit 1: aggregate per-gen audits and print histogram ----
+        # Each per-gen snapshot has its own audit dict (because reset_stats
+        # zeroes them between gens). Sum across gens to get the full-run
+        # histogram, run audit_check on it, and pretty-print.
+        aggregated_audit = NonDuplicationRecombination._fresh_audit()
+        for snap in per_generation_stats:
+            for k, v in snap.get("audit", {}).items():
+                aggregated_audit[k] = aggregated_audit.get(k, 0) + v
+        diag_recomb.audit_summary(
+            audit=aggregated_audit,
+            header=f"{file_path.name} -- {self.num_generations} gen(s) cumulative",
+        )
+
         del diag_g, diag_recomb
         gc.collect()
 
         # Stash per-generation snapshots on the diagnostic record for this file.
+        # `aggregated_audit` is also stashed so consumers of the JSON don't
+        # have to re-aggregate from per_generation entries.
         self.diagnostics.setdefault(file_path.name, {})["per_generation"] = per_generation_stats
+        self.diagnostics[file_path.name]["audit_aggregated"] = aggregated_audit
         self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
 
         grg_mean, grg_std, grg_sizes_mean, grg_size_changes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes), np.mean(grg_size_changes)

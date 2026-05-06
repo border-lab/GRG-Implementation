@@ -136,6 +136,48 @@ class NonDuplicationRecombination:
         self.instrument = instrument
         self.stats = self._fresh_stats()
 
+        # ----- Audit 1: case-counter instrumentation -----
+        # Cumulative per-decision-case counts. Every visit in _recurse_attach
+        # falls into exactly one of 13 matrix cells (9 standard + 4 root
+        # variants); audit_check() asserts that the implementation's bubble,
+        # connect, and make_node totals match what the matrix prescribes.
+        # Always-on (independent of `instrument`): each increment is a single
+        # dict op, dominated by surrounding work.
+        self.audit = self._fresh_audit()
+
+    @staticmethod
+    def _fresh_audit():
+        return {
+            # row "no relevant" (Mu cap I = empty)
+            'pruning':                  0,  # has_no_relevant + ancestral_disjoint
+            'pruning_root':             0,  # has_no_relevant + Iu is None
+            'path_compression':         0,  # has_no_relevant + full_coverage
+            'decomposition':            0,  # has_no_relevant + partial overlap
+            # row "all covered" (Mu subset I)
+            'direct_attach':            0,  # has_all_relevant + full_coverage
+            'direct_attach_root':       0,  # has_all_relevant + Iu is None
+            'bubble_strip':             0,  # has_all_relevant + ancestral_disjoint
+            'bubble_split':             0,  # has_all_relevant + partial overlap
+            'direct_attach_dup':        0,  # connected_gen guard skipped a duplicate edge
+            # row "partial relevant"
+            'bubble_fill':              0,  # has_partial_relevant + full_coverage
+            'bubble_strip_partial':     0,  # has_partial_relevant + ancestral_disjoint
+            'bubble_split_partial':     0,  # has_partial_relevant + partial overlap
+            'bubble_strip_partial_rt':  0,  # has_partial_relevant + Iu is None
+            # informational skips (not in matrix)
+            'skip_empty_interval':      0,  # L >= R at top of loop
+            'skip_already_visited':     0,  # gen_v guard fired
+            'skip_empty_trim':          0,  # newL >= newR after trim
+            # primitives that should reconcile against case sums
+            'visits':                   0,  # entries past both skip guards
+            'extract_bubble_calls':     0,
+            'connect_calls_in_attach':  0,  # connects fired inside _recurse_attach
+            'connect_calls_in_extract': 0,  # connects fired inside _extract_bubble (2/call)
+            'make_node_calls':          0,  # offspring + bubble nodes created
+            'recombine_calls':          0,  # recombine() + recombine_multi() entries
+            'recurse_attach_calls':     0,
+        }
+
     @staticmethod
     def _fresh_stats():
         return {
@@ -170,6 +212,11 @@ class NonDuplicationRecombination:
     def reset_stats(self):
         """Clear instrumentation accumulators (e.g. between generations)."""
         self.stats = self._fresh_stats()
+        self.audit = self._fresh_audit()
+
+    def audit_reset(self):
+        """Zero only the audit counters (leaves stats untouched)."""
+        self.audit = self._fresh_audit()
 
     # ------------------------------------------------------------------
     # Per-node array growth
@@ -289,12 +336,14 @@ class NonDuplicationRecombination:
 
     def _extract_bubble(self, node_id, relevant_mut_ids, offspring_id, interval):
         instrument = self.instrument
+        audit = self.audit
         if instrument:
             t = time.perf_counter()
         bubble_id = self.grg.make_node()
         if instrument:
             self.stats["make_node_time"] += time.perf_counter() - t
             self.stats["make_node_calls"] += 1
+        audit['make_node_calls'] += 1
 
         self._grow_node_arrays(bubble_id)
 
@@ -305,6 +354,8 @@ class NonDuplicationRecombination:
         if instrument:
             self.stats["connect_time"] += time.perf_counter() - t
             self.stats["connect_calls"] += 2
+        audit['connect_calls_in_extract'] += 2
+        audit['extract_bubble_calls'] += 1
 
         # node_id just gained a new up-edge; drop its cached up-edges list.
         self._up_edges_cache.pop(node_id, None)
@@ -349,6 +400,9 @@ class NonDuplicationRecombination:
         extract_bubble = self._extract_bubble
         grg_connect = self.grg.connect
         pending_sample_removals_add = self._pending_sample_removals.add
+        audit = self.audit  # hoisted for inner-loop speed
+
+        audit['recurse_attach_calls'] += 1
 
         neg_offspring = -offspring_id
         stack = [(root_id, L0, R0)]
@@ -359,10 +413,13 @@ class NonDuplicationRecombination:
             node_id, L, R = stack_pop()
 
             if L >= R:
+                audit['skip_empty_interval'] += 1
                 continue
             if visited_gen[node_id] == gen_v:
+                audit['skip_already_visited'] += 1
                 continue
             visited_gen[node_id] = gen_v
+            audit['visits'] += 1
 
             # Inlined _get_mutation_range + _get_node_mutations cache-hit path.
             positions = pos_cache.get(node_id)
@@ -389,14 +446,25 @@ class NonDuplicationRecombination:
                 Iu = get_ancestral_coverage(node_id)
 
             if Iu is None:
-                if has_all_relevant and connected_gen[node_id] != gen_c:
-                    grg_connect(node_id, neg_offspring)
-                    connected_gen[node_id] = gen_c
-                    pending_sample_removals_add(node_id)
-                if has_partial_relevant:
+                # Root: only own muts matter. The 4 sub-cases are mutually
+                # exclusive; structured as if/elif/else so audit tagging is
+                # one-per-visit.
+                if has_all_relevant:
+                    if connected_gen[node_id] != gen_c:
+                        grg_connect(node_id, neg_offspring)
+                        connected_gen[node_id] = gen_c
+                        pending_sample_removals_add(node_id)
+                        audit['direct_attach_root'] += 1
+                        audit['connect_calls_in_attach'] += 1
+                    else:
+                        audit['direct_attach_dup'] += 1
+                elif has_partial_relevant:
                     rel_mut_ids = [m[0] for m in mutation_cache[node_id][left:right]]
                     bubble_id = extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
                     connected_gen[bubble_id] = gen_c
+                    audit['bubble_strip_partial_rt'] += 1
+                else:
+                    audit['pruning_root'] += 1
                 continue
 
             Iu0 = Iu[0]
@@ -409,9 +477,14 @@ class NonDuplicationRecombination:
                     grg_connect(node_id, neg_offspring)
                     connected_gen[node_id] = gen_c
                     pending_sample_removals_add(node_id)
+                    audit['direct_attach'] += 1
+                    audit['connect_calls_in_attach'] += 1
+                else:
+                    audit['direct_attach_dup'] += 1
                 continue
 
             if has_no_relevant and ancestral_disjoint:
+                audit['pruning'] += 1
                 continue
 
             if has_no_relevant:
@@ -419,7 +492,12 @@ class NonDuplicationRecombination:
                 # at this call rate (showed up at ~50ms in the profile).
                 newL = L if L > Iu0 else Iu0
                 newR = R if R < Iu1 else Iu1
+                if full_coverage:
+                    audit['path_compression'] += 1
+                else:
+                    audit['decomposition'] += 1
                 if newL >= newR:
+                    audit['skip_empty_trim'] += 1
                     continue
                 for parent in reversed(get_up_edges_cached(node_id)):
                     stack_append((parent, newL, newR))
@@ -430,10 +508,25 @@ class NonDuplicationRecombination:
             bubble_id = extract_bubble(node_id, rel_mut_ids, offspring_id, (L, R))
             connected_gen[bubble_id] = gen_c
 
+            # Classify exactly one of the 5 non-root bubble cells.
+            if has_all_relevant:
+                if ancestral_disjoint:
+                    audit['bubble_strip'] += 1
+                else:
+                    audit['bubble_split'] += 1
+            else:  # has_partial_relevant
+                if full_coverage:
+                    audit['bubble_fill'] += 1
+                elif ancestral_disjoint:
+                    audit['bubble_strip_partial'] += 1
+                else:
+                    audit['bubble_split_partial'] += 1
+
             if not ancestral_disjoint:
                 newL = L if L > Iu0 else Iu0
                 newR = R if R < Iu1 else Iu1
                 if newL >= newR:
+                    audit['skip_empty_trim'] += 1
                     continue
                 for parent in reversed(get_up_edges_cached(node_id)):
                     stack_append((parent, newL, newR))
@@ -528,6 +621,7 @@ class NonDuplicationRecombination:
 
     def recombine(self, haplotype_A, haplotype_B, breakpoint):
         instrument = self.instrument
+        self.audit['recombine_calls'] += 1
         self._pending_bubbles.clear()
 
         if instrument:
@@ -541,6 +635,7 @@ class NonDuplicationRecombination:
         if instrument:
             self.stats["make_node_time"] += time.perf_counter() - t
             self.stats["make_node_calls"] += 1
+        self.audit['make_node_calls'] += 1
         self._grow_node_arrays(self.grg.num_nodes - 1)
         self._gen_connected += 1
 
@@ -574,6 +669,7 @@ class NonDuplicationRecombination:
 
     def recombine_multi(self, segments):
         instrument = self.instrument
+        self.audit['recombine_calls'] += 1
         self._pending_bubbles.clear()
 
         if instrument:
@@ -587,6 +683,7 @@ class NonDuplicationRecombination:
         if instrument:
             self.stats["make_node_time"] += time.perf_counter() - t
             self.stats["make_node_calls"] += 1
+        self.audit['make_node_calls'] += 1
         self._grow_node_arrays(self.grg.num_nodes - 1)
         self._gen_connected += 1
 
@@ -619,6 +716,137 @@ class NonDuplicationRecombination:
             self.stats["offspring_count"] += 1
 
         return self._register_offspring(offspring_id)
+
+    # ------------------------------------------------------------------
+    # Audit 1: invariant checks and reporting
+    # ------------------------------------------------------------------
+
+    def audit_check(self, audit=None, raise_on_fail=True):
+        """
+        Verify implementation matches algorithm spec on cumulative counts.
+
+        Pass an `audit` dict to check an aggregated/saved snapshot;
+        otherwise checks `self.audit`. Raises AssertionError on first
+        failure if `raise_on_fail`. Returns dict of {name: result}.
+
+        Invariants:
+          (1) extract_bubble_calls == sum of 6 bubble-case counters.
+              Failure => bubble was created outside the matrix, or a
+              matrix branch ran without calling _extract_bubble.
+          (2) total connect calls == 2*extract_bubble_calls + firing
+              direct attaches. Failure => connect() was invoked outside
+              the two prescribed paths.
+          (3) make_node_calls == recombine_calls + extract_bubble_calls.
+              Failure => a node was created outside offspring/bubble paths.
+        """
+        a = audit if audit is not None else self.audit
+
+        bubble_cases = (a['bubble_strip'] + a['bubble_split'] +
+                        a['bubble_fill'] + a['bubble_strip_partial'] +
+                        a['bubble_split_partial'] + a['bubble_strip_partial_rt'])
+        # direct_attach_dup did NOT call connect (gen_c guard fired),
+        # so it is excluded from the connect identity.
+        direct_firing = a['direct_attach'] + a['direct_attach_root']
+        total_connects = a['connect_calls_in_attach'] + a['connect_calls_in_extract']
+        expected_connects = 2 * a['extract_bubble_calls'] + direct_firing
+        expected_make_nodes = a['recombine_calls'] + a['extract_bubble_calls']
+
+        results = {
+            'bubble_identity': {
+                'lhs': a['extract_bubble_calls'], 'rhs': bubble_cases,
+                'pass': a['extract_bubble_calls'] == bubble_cases,
+                'desc': 'extract_bubble_calls == sum of 6 bubble-case counters',
+            },
+            'connect_identity': {
+                'lhs': total_connects, 'rhs': expected_connects,
+                'pass': total_connects == expected_connects,
+                'desc': 'total connect calls == 2*bubbles + firing direct attaches',
+            },
+            'make_node_identity': {
+                'lhs': a['make_node_calls'], 'rhs': expected_make_nodes,
+                'pass': a['make_node_calls'] == expected_make_nodes,
+                'desc': 'make_node_calls == recombine_calls + bubbles',
+            },
+        }
+
+        if raise_on_fail:
+            for name, r in results.items():
+                if not r['pass']:
+                    raise AssertionError(
+                        f"audit_check FAIL [{name}]: {r['desc']} -- "
+                        f"lhs={r['lhs']}, rhs={r['rhs']}, "
+                        f"delta={r['lhs'] - r['rhs']}"
+                    )
+        return results
+
+    def audit_summary(self, audit=None, header=None):
+        """Pretty-print the case histogram + identity check.
+
+        Pass `audit` to summarise an aggregated/saved snapshot; otherwise
+        summarises `self.audit`. `header` is an optional title prefix.
+        """
+        a = audit if audit is not None else self.audit
+        bubble_cases = (a['bubble_strip'] + a['bubble_split'] +
+                        a['bubble_fill'] + a['bubble_strip_partial'] +
+                        a['bubble_split_partial'] + a['bubble_strip_partial_rt'])
+        direct_firing = a['direct_attach'] + a['direct_attach_root']
+        total_decisions = (
+            a['pruning'] + a['pruning_root']
+            + a['path_compression'] + a['decomposition']
+            + a['direct_attach'] + a['direct_attach_root'] + a['direct_attach_dup']
+            + bubble_cases
+        )
+
+        def pct(n):
+            return (100.0 * n / total_decisions) if total_decisions else 0.0
+
+        lines = []
+        title = "AUDIT 1 -- decision case histogram"
+        if header:
+            title = f"{title}  ({header})"
+        lines.append("=" * 64)
+        lines.append(title)
+        lines.append("=" * 64)
+        lines.append(f"{'case':<30s} {'count':>14s}  {'%':>6s}")
+        lines.append("-" * 64)
+        for k in ('pruning', 'pruning_root',
+                  'path_compression', 'decomposition',
+                  'direct_attach', 'direct_attach_root', 'direct_attach_dup',
+                  'bubble_strip', 'bubble_split',
+                  'bubble_fill',
+                  'bubble_strip_partial', 'bubble_split_partial',
+                  'bubble_strip_partial_rt'):
+            lines.append(f"{k:<30s} {a[k]:>14d}  {pct(a[k]):>5.1f}%")
+        lines.append("-" * 64)
+        lines.append(f"{'TOTAL DECISIONS':<30s} {total_decisions:>14d}")
+        lines.append("")
+        lines.append(f"{'visits (post-skip-guards)':<30s} {a['visits']:>14d}")
+        lines.append(f"{'skip_empty_interval':<30s} {a['skip_empty_interval']:>14d}")
+        lines.append(f"{'skip_already_visited':<30s} {a['skip_already_visited']:>14d}")
+        lines.append(f"{'skip_empty_trim':<30s} {a['skip_empty_trim']:>14d}")
+        lines.append("")
+        lines.append("Primitives:")
+        lines.append(f"{'recombine_calls':<30s} {a['recombine_calls']:>14d}")
+        lines.append(f"{'recurse_attach_calls':<30s} {a['recurse_attach_calls']:>14d}")
+        lines.append(f"{'extract_bubble_calls':<30s} {a['extract_bubble_calls']:>14d}")
+        lines.append(f"{'make_node_calls':<30s} {a['make_node_calls']:>14d}")
+        lines.append(f"{'connect (in _recurse_attach)':<30s} {a['connect_calls_in_attach']:>14d}")
+        lines.append(f"{'connect (in _extract_bubble)':<30s} {a['connect_calls_in_extract']:>14d}")
+        lines.append("")
+        if a['recombine_calls']:
+            lines.append("Per-recombine averages:")
+            lines.append(f"  bubbles / offspring     {a['extract_bubble_calls']/a['recombine_calls']:>10.3f}")
+            lines.append(f"  visits / offspring      {a['visits']/a['recombine_calls']:>10.3f}")
+            lines.append(f"  segments / offspring    {a['recurse_attach_calls']/a['recombine_calls']:>10.3f}")
+            lines.append(f"  edges added / offspring {(2*bubble_cases + direct_firing)/a['recombine_calls']:>10.3f}")
+        lines.append("")
+        lines.append("Identities (via audit_check):")
+        results = self.audit_check(audit=a, raise_on_fail=False)
+        for r in results.values():
+            mark = "OK" if r['pass'] else "FAIL"
+            lines.append(f"  [{mark}] {r['desc']}: lhs={r['lhs']} rhs={r['rhs']}")
+        lines.append("=" * 64)
+        print("\n".join(lines))
 
 
 def simulate_grg_recombination(benchmark, recomb, bp_range, N):
