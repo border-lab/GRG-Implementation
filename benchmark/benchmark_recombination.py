@@ -95,6 +95,7 @@ class BenchmarkResult:
     min_time_ms: float
     max_time_ms: float
     nodes_added: int = 0
+    edges_added: int = 0
     memory_mb: float = 0.0
 
 @dataclass
@@ -250,6 +251,7 @@ class RecombinationBenchmarker:
         base_samples = g_base.num_samples
         base_mutations = g_base.num_mutations
         base_nodes = g_base.num_nodes
+        base_edges = g_base.num_edges
         # Shared physical interval for breakpoint draws (GRG + NumPy baseline).
         base_genome = g_base.bp_range
         base_couples = base_samples // 2
@@ -280,8 +282,10 @@ class RecombinationBenchmarker:
         # It will have (base_samples + num_offspring) columns
         est_mb = estimate_numpy_memory(base_mutations, base_samples + self.num_offspring_per_couple * base_couples)
 
-        skip_numpy = False
-        if est_mb > self.memory_limit_mb:
+        skip_numpy = not self.include_numpy
+        if skip_numpy:
+            print(f"  [Skipping NumPy] disabled via --skip-numpy")
+        elif est_mb > self.memory_limit_mb:
             print(f"  [Skipping NumPy] Estimated memory ({est_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB)")
             skip_numpy = True
 
@@ -297,14 +301,16 @@ class RecombinationBenchmarker:
         # run numpy recombination
         # repeat steps 1-3 for num_runs and num_warmup
 
-        print(f"\nGenerating Base NumPy Population Matrix...")
-        base_numpy_population_matrix = grg_to_numpy_parallel(pygrgl.load_mutable_grg(str(file_path)))
+        if not skip_numpy:
+            print(f"\nGenerating Base NumPy Population Matrix...")
+            base_numpy_population_matrix = grg_to_numpy_parallel(pygrgl.load_mutable_grg(str(file_path)))
 
         grg_times = []
         grg_sizes = []
         grg_size_changes = []
         numpy_times = []
         total_nodes_added = 0
+        total_edges_added = 0
 
         for i in range(self.num_warmup + self.num_runs):
 
@@ -362,9 +368,10 @@ class RecombinationBenchmarker:
             if i >= self.num_warmup:
                 grg_times.append(elapsed * 1000)  # Convert to ms
 
-            # Grab node count on the last run for space complexity metrics
+            # Grab node and edge counts on timed runs for space complexity metrics
             if i >= self.num_warmup:
                 total_nodes_added += g.num_nodes - base_nodes
+                total_edges_added += g.num_edges - base_edges
             
             gc.collect()
             mem_after = get_process_memory_mb()
@@ -428,12 +435,22 @@ class RecombinationBenchmarker:
             snapshot["generation_index"] = gen
             snapshot["generation_wallclock_s"] = gen_elapsed
             snapshot["num_nodes_after_gen"] = diag_g.num_nodes
+            snapshot["num_edges_after_gen"] = diag_g.num_edges
+            # Total edges added this generation = all connect() calls. The audit
+            # tracks both direct-attach and extract-bubble connects;
+            # stats['connect_calls'] only covers extract-bubble (timed path).
+            edges_added_this_gen = (
+                snapshot["audit"]["connect_calls_in_attach"]
+                + snapshot["audit"]["connect_calls_in_extract"]
+            )
+            snapshot["edges_added_this_gen"] = edges_added_this_gen
             per_generation_stats.append(snapshot)
             print(f"    wallclock={gen_elapsed:.2f}s "
                   f"offspring={snapshot['offspring_count']} "
                   f"bubbles={snapshot['bubbles_created']} "
                   f"muts_moved={snapshot['mutations_moved']} "
-                  f"visits={snapshot['visits_total']}")
+                  f"visits={snapshot['visits_total']} "
+                  f"edges_added={edges_added_this_gen}")
             if snapshot["remove_mutation_calls"]:
                 rm_us = snapshot["remove_mutation_time"] / snapshot["remove_mutation_calls"] * 1e6
                 print(f"    remove_mutation per-call: {rm_us:.2f} us "
@@ -475,6 +492,7 @@ class RecombinationBenchmarker:
             numpy_bp_mean = total_numpy_bp / (self.num_runs * self.num_generations)
         actual_offspring_generated = self.num_couples * self.num_offspring_per_couple * self.num_generations
         nodes_added_per_run = total_nodes_added / self.num_runs
+        edges_added_per_run = total_edges_added / self.num_runs
 
         self.results.append(BenchmarkResult(
             file=file_path.name, num_offspring=actual_offspring_generated,
@@ -483,7 +501,9 @@ class RecombinationBenchmarker:
             num_bp=total_grg_bp, mean_bp=grg_bp_mean,
             mean_time_ms=grg_mean, std_time_ms=grg_std,
             min_time_ms=np.min(grg_times), max_time_ms=np.max(grg_times),
-            nodes_added=nodes_added_per_run, memory_mb=grg_sizes_mean,
+            nodes_added=nodes_added_per_run,
+            edges_added=edges_added_per_run,
+            memory_mb=grg_sizes_mean,
         ))
 
         if not skip_numpy:
@@ -494,13 +514,14 @@ class RecombinationBenchmarker:
                 num_bp=total_numpy_bp, mean_bp=numpy_bp_mean,
                 mean_time_ms=numpy_mean, std_time_ms=numpy_std,
                 min_time_ms=np.min(numpy_times), max_time_ms=np.max(numpy_times),
-                nodes_added=0, memory_mb=est_mb
+                nodes_added=0, edges_added=0, memory_mb=est_mb
             ))
 
         print(f"\nResults for {file_path.name}:\n")
 
         print(f"  GRG Native:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
         print(f"  Space Delta:    +{nodes_added_per_run:.2f} nodes created per run on average")
+        print(f"  Edge Delta:     +{edges_added_per_run:.2f} edges created per run on average")
         print(f"  GRG Breakpoints: {grg_bp_mean:.2f} average breakpoints per generation")
         print(f"  GRG Memory:     {grg_sizes_mean:.1f} MB average resident memory")
         print(f"  Memory Delta:   +{grg_size_changes_mean:.1f} MB (GRG recombination memory increase), ")
@@ -678,9 +699,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-generations", type=int, default=2, help="Number of sequential recombination generations to simulate (default: 2)")
     parser.add_argument("--memory-limit", type=float, default=15000.0, help="Memory limit in MB (default: 15000)")
-    
+    parser.add_argument("--skip-numpy", action="store_true",
+                        help="Skip the NumPy baseline entirely; no dense matrix is built")
+
     args = parser.parse_args()
-    
+
     benchmarker = RecombinationBenchmarker(
         grg_files_dir=args.grg_dir,
         output_dir=args.output_dir,
@@ -688,7 +711,8 @@ if __name__ == "__main__":
         num_runs=args.runs,
         num_offspring_per_couple=args.offspring_per_couple,
         num_generations=args.num_generations,
-        memory_limit_mb=args.memory_limit
+        memory_limit_mb=args.memory_limit,
+        include_numpy=not args.skip_numpy,
     )
     
     benchmarker.run_benchmarks()
