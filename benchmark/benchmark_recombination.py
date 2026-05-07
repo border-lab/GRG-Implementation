@@ -402,7 +402,8 @@ class RecombinationBenchmarker:
                         bp_range=base_genome,
                         expected_crossovers=1.5,
                     )
-                    total_numpy_bp += gen_bp
+                    if i >= self.num_warmup:
+                        total_numpy_bp += gen_bp
                     if debug:
                         print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_numpy_bp}")
                 elapsed = time.perf_counter() - start

@@ -100,6 +100,13 @@ class NonDuplicationRecombination:
     - `_extract_bubble` no longer invalidates the caches of node_id's
       parents; bubble extraction does not affect their span or ancestral
       coverage, so invalidation just thrashes high-traffic cache entries.
+    - Up-edge walks in `_recurse_attach` skip parents already attached to
+      the current offspring (`connected_gen[parent] == gen_c`). Bubbles
+      created in earlier segments of the same offspring carry mutations
+      confined to those earlier segments' intervals, so revisiting them
+      in later segments produces only pruning_root events. Filter is
+      per-offspring (gen_c bumps per recombine call), so bubbles from
+      previous offspring remain reachable for legitimate reuse.
     """
 
     debug_mode = False
@@ -499,8 +506,13 @@ class NonDuplicationRecombination:
                 if newL >= newR:
                     audit['skip_empty_trim'] += 1
                     continue
+                # Skip parents already attached to this offspring (typically
+                # bubbles created in earlier segments). Their mutations live
+                # in disjoint intervals so re-descending them only produces
+                # pruning_root events.
                 for parent in reversed(get_up_edges_cached(node_id)):
-                    stack_append((parent, newL, newR))
+                    if connected_gen[parent] != gen_c:
+                        stack_append((parent, newL, newR))
                 continue
 
             # Partial / all relevant, not full coverage -> bubble + maybe recurse.
@@ -528,8 +540,11 @@ class NonDuplicationRecombination:
                 if newL >= newR:
                     audit['skip_empty_trim'] += 1
                     continue
+                # Same offspring-local skip: already-attached parents have
+                # nothing useful to contribute to subsequent segments.
                 for parent in reversed(get_up_edges_cached(node_id)):
-                    stack_append((parent, newL, newR))
+                    if connected_gen[parent] != gen_c:
+                        stack_append((parent, newL, newR))
 
     # ------------------------------------------------------------------
     # Apply deferred work, evict caches
