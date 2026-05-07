@@ -351,7 +351,8 @@ class RecombinationBenchmarker:
                 offspring_ids, gen_bp = simulate_grg_recombination(self, recomb, base_genome, N=base_genome[1])
                 # pr.disable()
                 # pstats.Stats(pr).sort_stats('cumtime').print_stats(25)  # Print top 25 cumulative time functions
-                total_grg_bp += gen_bp
+                if i >= self.num_warmup:
+                    total_grg_bp += gen_bp
                 if debug:
                     print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_grg_bp}")
             elapsed = time.perf_counter() - start

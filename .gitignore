@@ -1,6 +1,7 @@
 # Ignore grg test files
 benchmark/test_grg_files
 benchmark/test_small
+grg_files
 
 # Ignore benchmark output
 benchmark/output
