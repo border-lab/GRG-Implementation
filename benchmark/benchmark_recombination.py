@@ -29,6 +29,7 @@ from grg_recombination import (
     compute_grg_structural_stats,
 )
 from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
+from multitree_check import compute_post_recomb_anc_counts, check_offspring
 
 # DEBUG Mode
 debug = True
@@ -117,7 +118,9 @@ class RecombinationBenchmarker:
         num_offspring_per_couple: int = 2,
         num_generations: int = 2,
         memory_limit_mb: float = 15000.0,
-        include_numpy: bool = True
+        include_numpy: bool = True,
+        verification: bool = False,
+        run_diagnostics: bool = False
     ):
         self.grg_dir = grg_files_dir
         self.output_dir = output_dir
@@ -128,7 +131,13 @@ class RecombinationBenchmarker:
         self.num_generations = num_generations
         self.memory_limit_mb = memory_limit_mb
         self.include_numpy = include_numpy
+        self.verification = verification
+        self.run_diagnostics = run_diagnostics
         self.results = []
+        # Always-initialized so that verification_checks (which is a separate
+        # concern from --diagnostics) can stash per-file results without
+        # depending on whether structural-stats / diagnostic-pass ran.
+        self.diagnostics = {}
         
         try:
             pygrgl_ver = pygrgl.__version__
@@ -179,6 +188,10 @@ class RecombinationBenchmarker:
                 "(one breakpoint draw per couple; sibling rows partition p1/p2 per segment)"
             )
         print(f"Memory limit: {self.memory_limit_mb} MB")
+        print(f"Diagnostics: {'ON' if self.run_diagnostics else 'OFF'} "
+              f"(structural stats + instrumented diagnostic pass)")
+        print(f"Verification: {'ON' if self.verification else 'OFF'} "
+              f"(audit identities + multitree-violation check after each non-warmup run)")
         print("=" * 80)
 
     def get_breakpoints(self, bp_range, expected_crossovers=1.5):
@@ -261,22 +274,23 @@ class RecombinationBenchmarker:
         print(f" Couples: {base_couples} (from {base_samples} samples)")
 
         # ---- Structural stats (one-shot, before any recombination) ----
-        print("\nComputing structural stats...")
-        struct_t0 = time.perf_counter()
-        structural_stats = compute_grg_structural_stats(g_base)
-        print(f"  done in {time.perf_counter() - struct_t0:.2f}s")
-        for key in ("num_nodes", "num_edges", "num_samples", "num_mutations",
-                    "num_roots", "internal_per_sample", "genome_length"):
-            print(f"  {key:25s} {structural_stats[key]}")
-        for key in ("mutations_per_node", "up_fanout", "sample_depth"):
-            s = structural_stats[key]
-            if s.get("count", 0):
-                print(f"  {key:25s} mean={s['mean']:.2f} p50={s['p50']} p95={s['p95']} max={s['max']}")
-        # File the structural stats away on the instance keyed by filename
-        # so save_results() picks them up.
-        if not hasattr(self, "diagnostics"):
-            self.diagnostics = {}
-        self.diagnostics[file_path.name] = {"structural": structural_stats}
+        # Gated by --diagnostics: compute & report structural fingerprint
+        # (num_nodes, num_edges, roots, mutations-per-node distribution, etc.).
+        # Off by default since this is for understanding GRG topology, not
+        # for the timing/memory benchmark itself.
+        if self.run_diagnostics:
+            print("\nComputing structural stats...")
+            struct_t0 = time.perf_counter()
+            structural_stats = compute_grg_structural_stats(g_base)
+            print(f"  done in {time.perf_counter() - struct_t0:.2f}s")
+            for key in ("num_nodes", "num_edges", "num_samples", "num_mutations",
+                        "num_roots", "internal_per_sample", "genome_length"):
+                print(f"  {key:25s} {structural_stats[key]}")
+            for key in ("mutations_per_node", "up_fanout", "sample_depth"):
+                s = structural_stats[key]
+                if s.get("count", 0):
+                    print(f"  {key:25s} mean={s['mean']:.2f} p50={s['p50']} p95={s['p95']} max={s['max']}")
+            self.diagnostics[file_path.name] = {"structural": structural_stats}
 
         # Estimate memory for the POST-recombination NumPy array
         # It will have (base_samples + num_offspring) columns
@@ -346,6 +360,7 @@ class RecombinationBenchmarker:
             if debug:
                 print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with GRG recombination...")
             total_grg_bp = 0
+            all_offspring_ids = []
             start = time.perf_counter()
             recomb = NonDuplicationRecombination(g)
             for gen in range(self.num_generations):
@@ -357,6 +372,7 @@ class RecombinationBenchmarker:
                 offspring_ids, gen_bp = simulate_grg_recombination(self, recomb, base_genome, N=base_genome[1])
                 # pr.disable()
                 # pstats.Stats(pr).sort_stats('cumtime').print_stats(25)  # Print top 25 cumulative time functions
+                all_offspring_ids.extend(offspring_ids)
                 if i >= self.num_warmup:
                     total_grg_bp += gen_bp
                 if debug:
@@ -364,7 +380,7 @@ class RecombinationBenchmarker:
             elapsed = time.perf_counter() - start
             if debug:
                 print(f"\n  [Run {i+1}] Simulation finished in {elapsed:.4f} seconds.")
-            
+
             if i >= self.num_warmup:
                 grg_times.append(elapsed * 1000)  # Convert to ms
 
@@ -372,7 +388,52 @@ class RecombinationBenchmarker:
             if i >= self.num_warmup:
                 total_nodes_added += g.num_nodes - base_nodes
                 total_edges_added += g.num_edges - base_edges
-            
+
+            # ----- Verification block -----
+            # Off the timed path; runs only on non-warmup runs when opted in
+            # via --verification. Two layers:
+            #   (1) Three audit-identity checks (cheap; just summing audit
+            #       counters that recomb tracked during the run).
+            #   (2) Multitree-violation check (Approach B; per-offspring BFS,
+            #       expensive on biobank-scale data).
+            if self.verification and i >= self.num_warmup:
+                print(f"\n  [Run {i+1}] Running verification checks...")
+
+                # (1) Audit identities. recomb.audit accumulates across all
+                # generations of this run (we never reset_stats between gens
+                # on the non-instrumented path).
+                audit_results = recomb.audit_check(raise_on_fail=False)
+                audit_pass = sum(1 for r in audit_results.values() if r['pass'])
+                print(f"  [Run {i+1}] Audit identities: {audit_pass}/"
+                      f"{len(audit_results)} pass")
+                for r in audit_results.values():
+                    mark = "OK" if r['pass'] else "FAIL"
+                    print(f"    [{mark}] {r['desc']}: lhs={r['lhs']} rhs={r['rhs']}")
+
+                # (2) Multitree cardinality check.
+                mt_start = time.perf_counter()
+                anc_count = compute_post_recomb_anc_counts(g)
+                mt_result = check_offspring(g, all_offspring_ids, anc_count)
+                mt_elapsed = time.perf_counter() - mt_start
+                mt_sum = mt_result['summary']
+                print(f"  [Run {i+1}] Multitree check done in {mt_elapsed:.2f}s: "
+                      f"{mt_sum['violating']:,} / {mt_sum['total_checked']:,} "
+                      f"offspring violate ({100*mt_sum['violation_rate']:.2f}%); "
+                      f"{mt_sum['total_redundant_paths']:,} redundant paths total")
+
+                self.diagnostics.setdefault(file_path.name, {}) \
+                    .setdefault('verification_checks', []).append({
+                        'run_index': i,
+                        'is_warmup': False,
+                        'audit_identities': audit_results,
+                        'multitree': {
+                            'wallclock_s': mt_elapsed,
+                            'offspring_checked_across_gens': len(all_offspring_ids),
+                            'summary': mt_sum,
+                            'first_example': mt_result['first_example'],
+                        },
+                    })
+
             gc.collect()
             mem_after = get_process_memory_mb()
             grg_sizes.append(mem_after)
@@ -413,78 +474,80 @@ class RecombinationBenchmarker:
                     numpy_times.append(elapsed * 1000)  # Convert to ms
 
         # ----- Diagnostic pass with full instrumentation -----
-        # One additional GRG run with `instrument=True` so we capture phase
-        # breakdowns, C++ call costs (esp. add_mutation / remove_mutation),
-        # and per-offspring + per-bubble distributions per generation.
+        # Gated by --diagnostics: one additional GRG run with `instrument=True`
+        # so we capture phase breakdowns, C++ call costs (esp. add_mutation /
+        # remove_mutation), per-offspring + per-bubble distributions per
+        # generation, and the full audit-1 decision-case histogram.
         # Wallclock here is NOT used for the headline numbers above.
-        print(f"\nRunning instrumented diagnostic pass...")
-        diag_g = pygrgl.load_mutable_grg(str(file_path))
-        diag_recomb = NonDuplicationRecombination(diag_g, instrument=True)
-        per_generation_stats = []
-        diag_total_start = time.perf_counter()
-        for gen in range(self.num_generations):
-            print(f"  [Diag] Generation {gen+1}/{self.num_generations}...")
-            diag_recomb.reset_stats()  # also resets audit
-            gen_start = time.perf_counter()
-            simulate_grg_recombination(self, diag_recomb, base_genome, N=base_genome[1])
-            gen_elapsed = time.perf_counter() - gen_start
-            snapshot = dict(diag_recomb.stats)
-            # ---- Audit 1: snapshot per-generation case histogram ----
-            # `dict(...)` makes a shallow copy so subsequent reset_stats()
-            # doesn't clobber the saved values.
-            snapshot["audit"] = dict(diag_recomb.audit)
-            snapshot["generation_index"] = gen
-            snapshot["generation_wallclock_s"] = gen_elapsed
-            snapshot["num_nodes_after_gen"] = diag_g.num_nodes
-            snapshot["num_edges_after_gen"] = diag_g.num_edges
-            # Total edges added this generation = all connect() calls. The audit
-            # tracks both direct-attach and extract-bubble connects;
-            # stats['connect_calls'] only covers extract-bubble (timed path).
-            edges_added_this_gen = (
-                snapshot["audit"]["connect_calls_in_attach"]
-                + snapshot["audit"]["connect_calls_in_extract"]
+        if self.run_diagnostics:
+            print(f"\nRunning instrumented diagnostic pass...")
+            diag_g = pygrgl.load_mutable_grg(str(file_path))
+            diag_recomb = NonDuplicationRecombination(diag_g, instrument=True)
+            per_generation_stats = []
+            diag_total_start = time.perf_counter()
+            for gen in range(self.num_generations):
+                print(f"  [Diag] Generation {gen+1}/{self.num_generations}...")
+                diag_recomb.reset_stats()  # also resets audit
+                gen_start = time.perf_counter()
+                simulate_grg_recombination(self, diag_recomb, base_genome, N=base_genome[1])
+                gen_elapsed = time.perf_counter() - gen_start
+                snapshot = dict(diag_recomb.stats)
+                # ---- Audit 1: snapshot per-generation case histogram ----
+                # `dict(...)` makes a shallow copy so subsequent reset_stats()
+                # doesn't clobber the saved values.
+                snapshot["audit"] = dict(diag_recomb.audit)
+                snapshot["generation_index"] = gen
+                snapshot["generation_wallclock_s"] = gen_elapsed
+                snapshot["num_nodes_after_gen"] = diag_g.num_nodes
+                snapshot["num_edges_after_gen"] = diag_g.num_edges
+                # Total edges added this generation = all connect() calls. The audit
+                # tracks both direct-attach and extract-bubble connects;
+                # stats['connect_calls'] only covers extract-bubble (timed path).
+                edges_added_this_gen = (
+                    snapshot["audit"]["connect_calls_in_attach"]
+                    + snapshot["audit"]["connect_calls_in_extract"]
+                )
+                snapshot["edges_added_this_gen"] = edges_added_this_gen
+                per_generation_stats.append(snapshot)
+                print(f"    wallclock={gen_elapsed:.2f}s "
+                      f"offspring={snapshot['offspring_count']} "
+                      f"bubbles={snapshot['bubbles_created']} "
+                      f"muts_moved={snapshot['mutations_moved']} "
+                      f"visits={snapshot['visits_total']} "
+                      f"edges_added={edges_added_this_gen}")
+                if snapshot["remove_mutation_calls"]:
+                    rm_us = snapshot["remove_mutation_time"] / snapshot["remove_mutation_calls"] * 1e6
+                    print(f"    remove_mutation per-call: {rm_us:.2f} us "
+                          f"(total {snapshot['remove_mutation_time']:.2f}s "
+                          f"over {snapshot['remove_mutation_calls']:,} calls)")
+                if snapshot["add_mutation_calls"]:
+                    am_us = snapshot["add_mutation_time"] / snapshot["add_mutation_calls"] * 1e6
+                    print(f"    add_mutation per-call:    {am_us:.2f} us")
+            diag_total = time.perf_counter() - diag_total_start
+            print(f"  Diagnostic pass total: {diag_total:.2f}s")
+
+            # ---- Audit 1: aggregate per-gen audits and print histogram ----
+            # Each per-gen snapshot has its own audit dict (because reset_stats
+            # zeroes them between gens). Sum across gens to get the full-run
+            # histogram, run audit_check on it, and pretty-print.
+            aggregated_audit = NonDuplicationRecombination._fresh_audit()
+            for snap in per_generation_stats:
+                for k, v in snap.get("audit", {}).items():
+                    aggregated_audit[k] = aggregated_audit.get(k, 0) + v
+            diag_recomb.audit_summary(
+                audit=aggregated_audit,
+                header=f"{file_path.name} -- {self.num_generations} gen(s) cumulative",
             )
-            snapshot["edges_added_this_gen"] = edges_added_this_gen
-            per_generation_stats.append(snapshot)
-            print(f"    wallclock={gen_elapsed:.2f}s "
-                  f"offspring={snapshot['offspring_count']} "
-                  f"bubbles={snapshot['bubbles_created']} "
-                  f"muts_moved={snapshot['mutations_moved']} "
-                  f"visits={snapshot['visits_total']} "
-                  f"edges_added={edges_added_this_gen}")
-            if snapshot["remove_mutation_calls"]:
-                rm_us = snapshot["remove_mutation_time"] / snapshot["remove_mutation_calls"] * 1e6
-                print(f"    remove_mutation per-call: {rm_us:.2f} us "
-                      f"(total {snapshot['remove_mutation_time']:.2f}s "
-                      f"over {snapshot['remove_mutation_calls']:,} calls)")
-            if snapshot["add_mutation_calls"]:
-                am_us = snapshot["add_mutation_time"] / snapshot["add_mutation_calls"] * 1e6
-                print(f"    add_mutation per-call:    {am_us:.2f} us")
-        diag_total = time.perf_counter() - diag_total_start
-        print(f"  Diagnostic pass total: {diag_total:.2f}s")
 
-        # ---- Audit 1: aggregate per-gen audits and print histogram ----
-        # Each per-gen snapshot has its own audit dict (because reset_stats
-        # zeroes them between gens). Sum across gens to get the full-run
-        # histogram, run audit_check on it, and pretty-print.
-        aggregated_audit = NonDuplicationRecombination._fresh_audit()
-        for snap in per_generation_stats:
-            for k, v in snap.get("audit", {}).items():
-                aggregated_audit[k] = aggregated_audit.get(k, 0) + v
-        diag_recomb.audit_summary(
-            audit=aggregated_audit,
-            header=f"{file_path.name} -- {self.num_generations} gen(s) cumulative",
-        )
+            del diag_g, diag_recomb
+            gc.collect()
 
-        del diag_g, diag_recomb
-        gc.collect()
-
-        # Stash per-generation snapshots on the diagnostic record for this file.
-        # `aggregated_audit` is also stashed so consumers of the JSON don't
-        # have to re-aggregate from per_generation entries.
-        self.diagnostics.setdefault(file_path.name, {})["per_generation"] = per_generation_stats
-        self.diagnostics[file_path.name]["audit_aggregated"] = aggregated_audit
-        self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
+            # Stash per-generation snapshots on the diagnostic record for this file.
+            # `aggregated_audit` is also stashed so consumers of the JSON don't
+            # have to re-aggregate from per_generation entries.
+            self.diagnostics.setdefault(file_path.name, {})["per_generation"] = per_generation_stats
+            self.diagnostics[file_path.name]["audit_aggregated"] = aggregated_audit
+            self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
 
         grg_mean, grg_std, grg_sizes_mean, grg_size_changes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes), np.mean(grg_size_changes)
         grg_bp_mean = total_grg_bp / (self.num_runs * self.num_generations)
@@ -702,6 +765,21 @@ if __name__ == "__main__":
     parser.add_argument("--memory-limit", type=float, default=15000.0, help="Memory limit in MB (default: 15000)")
     parser.add_argument("--skip-numpy", action="store_true",
                         help="Skip the NumPy baseline entirely; no dense matrix is built")
+    parser.add_argument("--verification", action="store_true",
+                        help="After each non-warmup GRG run, run two verification layers: "
+                             "(1) the three audit-identity checks (bubble_identity, "
+                             "connect_identity, make_node_identity) on the live recomb's "
+                             "audit counters; and (2) the multitree-violation check "
+                             "(Approach B cardinality test). Off the timed path but adds "
+                             "significant wallclock per file (e.g. ~2 min on 7500inds_1M). "
+                             "Default off.")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Run GRG-structural diagnostics for understanding the graph "
+                             "(orthogonal to the timing/memory benchmark itself): pre-recomb "
+                             "structural fingerprint (num_roots, mutations-per-node, fanout, "
+                             "sample_depth distributions) and an extra fully-instrumented "
+                             "diagnostic recomb pass (phase breakdowns, per-call C++ costs, "
+                             "audit-1 decision-case histogram). Default off.")
 
     args = parser.parse_args()
 
@@ -714,6 +792,8 @@ if __name__ == "__main__":
         num_generations=args.num_generations,
         memory_limit_mb=args.memory_limit,
         include_numpy=not args.skip_numpy,
+        verification=args.verification,
+        run_diagnostics=args.diagnostics,
     )
     
     benchmarker.run_benchmarks()
