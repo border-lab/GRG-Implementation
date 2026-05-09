@@ -19,3 +19,7 @@ benchmark/recombination_benchmark.zip
 
 # Ignore markdown files from benchmark
 benchmark/*.md
+
+# Ignore testing scripts
+benchmark/*.sh
+benchmark/*.slurm
