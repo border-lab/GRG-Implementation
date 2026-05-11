@@ -48,6 +48,17 @@ def _total_branch_length(ts) -> float:
     return float(((times[edges.parent] - times[edges.child]) * spans).sum())
 
 
+def _derive_construct_flags(
+    sequence_length: int, segment_size: int, num_jobs: int
+) -> tuple[int, int]:
+    """Pick `grg construct` -t / -p per DeHaas et al. Methods section
+    'Determining Parameters T and P': T = ceil(seq_len / segment_size);
+    P bounded by cores (>=) and T (<=)."""
+    trees = max(1, round(sequence_length / segment_size))
+    parts = min(num_jobs, trees)
+    return trees, parts
+
+
 def generate_grg(
     output_path: Path,
     *,
@@ -62,6 +73,7 @@ def generate_grg(
     construct_jobs: int = 1,
     construct_trees: int | None = None,
     construct_parts: int | None = None,
+    segment_size: int = 100_000,
     keep_vcf: bool = False,
     input_trees: Path | None = None,
 ) -> tuple[Path, int]:
@@ -148,18 +160,21 @@ def generate_grg(
                 vcf_path = Path(tmpdir) / "sim.vcf"
             with open(vcf_path, "w") as fh:
                 ts.write_vcf(fh)
+            derived_t, derived_p = _derive_construct_flags(
+                int(ts.sequence_length), segment_size, construct_jobs,
+            )
+            trees = construct_trees if construct_trees is not None else derived_t
+            parts = construct_parts if construct_parts is not None else derived_p
             # cwd=tmpdir keeps `grg construct`'s per-part .grg shards out of
             # the user's cwd; --force skips the unindexed-VCF stop-warning.
             cmd = [
                 grg_bin, "construct", str(vcf_path),
                 "-j", str(construct_jobs),
+                "-t", str(trees),
+                "-p", str(parts),
                 "--force",
                 "-o", str(abs_output),
             ]
-            if construct_trees is not None:
-                cmd.extend(["-t", str(construct_trees)])
-            if construct_parts is not None:
-                cmd.extend(["-p", str(construct_parts)])
             subprocess.check_call(cmd, cwd=tmpdir)
 
     print(f"  wrote {output_path}")
@@ -222,11 +237,15 @@ def main():
                         help="Threads passed to `grg construct -j` (--method vcf). "
                              "Default: 1")
     parser.add_argument("--construct-trees", type=int, default=None,
-                        help="Trees per part passed to `grg construct -t` "
-                             "(--method vcf). Default: auto")
+                        help="Override for `grg construct -t` (--method vcf). "
+                             "Default: derived as seq_len / --segment-size.")
     parser.add_argument("--construct-parts", type=int, default=None,
-                        help="Parts passed to `grg construct -p` (--method vcf). "
-                             "Default: auto")
+                        help="Override for `grg construct -p` (--method vcf). "
+                             "Default: min(--construct-jobs, derived T).")
+    parser.add_argument("--segment-size", type=int, default=100_000,
+                        help="Target segment size in bp used to derive "
+                             "`grg construct -t` (--method vcf). Paper "
+                             "recommends 50_000-150_000. Default: 100_000")
     parser.add_argument("--keep-vcf", action="store_true",
                         help="Keep the intermediate VCF next to the output GRG "
                              "(--method vcf only).")
@@ -280,6 +299,7 @@ def main():
         construct_jobs=args.construct_jobs,
         construct_trees=args.construct_trees,
         construct_parts=args.construct_parts,
+        segment_size=args.segment_size,
         keep_vcf=args.keep_vcf,
         input_trees=args.input_trees,
     )
