@@ -158,7 +158,8 @@ class NonDuplicationRecombination:
             # row "no relevant" (Mu cap I = empty)
             'pruning':                  0,  # has_no_relevant + ancestral_disjoint
             'pruning_root':             0,  # has_no_relevant + Iu is None
-            'path_compression':         0,  # has_no_relevant + full_coverage
+            'path_compression':         0,  # has_no_relevant + full_coverage (recursed)
+            'path_compression_attach':  0,  # has_no_relevant + full_coverage + fanout>1 (attached)
             'decomposition':            0,  # has_no_relevant + partial overlap
             # row "all covered" (Mu subset I)
             'direct_attach':            0,  # has_all_relevant + full_coverage
@@ -495,6 +496,43 @@ class NonDuplicationRecombination:
                 continue
 
             if has_no_relevant:
+                parents = get_up_edges_cached(node_id)
+                # Early-attach optimization: if a multi-parent empty
+                # intermediary fully covers [L, R), attach the offspring
+                # to it directly instead of walking up to its ancestors.
+                # Saves K-1 edges per chain (K = number of attaches the
+                # avoided recursion would have made). Gated on:
+                #   num_all == 0      -- has_no_relevant also matches nodes
+                #                        whose mutations all sit outside
+                #                        [L, R); attaching offspring there
+                #                        would transitively pull in those
+                #                        out-of-segment muts (correctness).
+                #   full_coverage     -- Iu(node_id) ⊂ [L, R), so the
+                #                        offspring inherits exactly the
+                #                        right mutations via this path.
+                #   len(parents) > 1  -- at fanout-1 the chain compresses
+                #                        to one edge anyway; attaching here
+                #                        is strictly worse (same edges,
+                #                        +1 hop forever).
+                #
+                # Multitree preservation: no extra work is required, by the
+                # same argument that lets direct_attach skip recursion. In
+                # a multitree input, every ancestor of node_id reaches the
+                # haplotype only via node_id, so sibling paths in this
+                # `_recurse_attach` call cannot reach those ancestors and
+                # cannot fire any attach branch on them. Bubbles created
+                # mid-call are roots (no parents), so they don't reintroduce
+                # multi-route paths. The frontier remains an antichain.
+                if num_all == 0 and full_coverage and len(parents) > 1:
+                    if connected_gen[node_id] != gen_c:
+                        grg_connect(node_id, neg_offspring)
+                        connected_gen[node_id] = gen_c
+                        pending_sample_removals_add(node_id)
+                        audit['path_compression_attach'] += 1
+                        audit['connect_calls_in_attach'] += 1
+                    else:
+                        audit['direct_attach_dup'] += 1
+                    continue
                 # Inline max/min — Python's builtins are surprisingly slow
                 # at this call rate (showed up at ~50ms in the profile).
                 newL = L if L > Iu0 else Iu0
@@ -510,7 +548,7 @@ class NonDuplicationRecombination:
                 # bubbles created in earlier segments). Their mutations live
                 # in disjoint intervals so re-descending them only produces
                 # pruning_root events.
-                for parent in reversed(get_up_edges_cached(node_id)):
+                for parent in reversed(parents):
                     if connected_gen[parent] != gen_c:
                         stack_append((parent, newL, newR))
                 continue
@@ -760,8 +798,11 @@ class NonDuplicationRecombination:
                         a['bubble_fill'] + a['bubble_strip_partial'] +
                         a['bubble_split_partial'] + a['bubble_strip_partial_rt'])
         # direct_attach_dup did NOT call connect (gen_c guard fired),
-        # so it is excluded from the connect identity.
-        direct_firing = a['direct_attach'] + a['direct_attach_root']
+        # so it is excluded from the connect identity. path_compression_attach
+        # DOES call connect (one per firing), so it joins the direct-firing
+        # term that balances against connect_calls_in_attach.
+        direct_firing = (a['direct_attach'] + a['direct_attach_root']
+                         + a['path_compression_attach'])
         total_connects = a['connect_calls_in_attach'] + a['connect_calls_in_extract']
         expected_connects = 2 * a['extract_bubble_calls'] + direct_firing
         expected_make_nodes = a['recombine_calls'] + a['extract_bubble_calls']
@@ -804,10 +845,12 @@ class NonDuplicationRecombination:
         bubble_cases = (a['bubble_strip'] + a['bubble_split'] +
                         a['bubble_fill'] + a['bubble_strip_partial'] +
                         a['bubble_split_partial'] + a['bubble_strip_partial_rt'])
-        direct_firing = a['direct_attach'] + a['direct_attach_root']
+        direct_firing = (a['direct_attach'] + a['direct_attach_root']
+                         + a['path_compression_attach'])
         total_decisions = (
             a['pruning'] + a['pruning_root']
-            + a['path_compression'] + a['decomposition']
+            + a['path_compression'] + a['path_compression_attach']
+            + a['decomposition']
             + a['direct_attach'] + a['direct_attach_root'] + a['direct_attach_dup']
             + bubble_cases
         )
@@ -825,7 +868,8 @@ class NonDuplicationRecombination:
         lines.append(f"{'case':<30s} {'count':>14s}  {'%':>6s}")
         lines.append("-" * 64)
         for k in ('pruning', 'pruning_root',
-                  'path_compression', 'decomposition',
+                  'path_compression', 'path_compression_attach',
+                  'decomposition',
                   'direct_attach', 'direct_attach_root', 'direct_attach_dup',
                   'bubble_strip', 'bubble_split',
                   'bubble_fill',
