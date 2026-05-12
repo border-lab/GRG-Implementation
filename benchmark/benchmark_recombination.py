@@ -29,7 +29,7 @@ from grg_recombination import (
     compute_grg_structural_stats,
 )
 from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
-from multitree_check import compute_post_recomb_anc_counts, check_offspring
+from multitree_check import compute_post_recomb_anc_counts, check_offspring, compute_liveness
 
 # DEBUG Mode
 debug = True
@@ -98,6 +98,11 @@ class BenchmarkResult:
     nodes_added: int = 0
     edges_added: int = 0
     memory_mb: float = 0.0
+    # Liveness diagnostic (averaged across timed_runs * num_generations snapshots).
+    # Populated for GRG Native only; remains 0.0 for the NumPy baseline row.
+    mean_dead_nodes: float = 0.0
+    mean_dead_pct: float = 0.0
+    mean_dead_mutations: float = 0.0
 
 @dataclass
 class SystemInfo:
@@ -189,7 +194,7 @@ class RecombinationBenchmarker:
             )
         print(f"Memory limit: {self.memory_limit_mb} MB")
         print(f"Diagnostics: {'ON' if self.run_diagnostics else 'OFF'} "
-              f"(structural stats + instrumented diagnostic pass)")
+              f"(structural stats + instrumented diagnostic pass + liveness/deadweight)")
         print(f"Verification: {'ON' if self.verification else 'OFF'} "
               f"(audit identities + multitree-violation check after each non-warmup run)")
         print("=" * 80)
@@ -325,6 +330,10 @@ class RecombinationBenchmarker:
         numpy_times = []
         total_nodes_added = 0
         total_edges_added = 0
+        # Liveness diagnostic: one entry per (timed_run, generation). Off the
+        # timed path -- we pause the wallclock timer around each call so the
+        # reported GRG runtime excludes BFS-upward time.
+        liveness_snapshots = []
 
         for i in range(self.num_warmup + self.num_runs):
 
@@ -375,6 +384,21 @@ class RecombinationBenchmarker:
                 all_offspring_ids.extend(offspring_ids)
                 if i >= self.num_warmup:
                     total_grg_bp += gen_bp
+                    # Liveness snapshot off the timed path. Gated on --diagnostics
+                    # so production benchmarks don't pay even the (cheap) O(|V|+|E|)
+                    # BFS-upward cost when the user isn't asking for it.
+                    # simulate_grg_recombination calls set_samples(new_offspring_ids)
+                    # at its tail, so the GRG's current sample set IS the new
+                    # generation; compute_liveness uses those as BFS-up seeds. We
+                    # pause the wallclock around the call so `elapsed` excludes the
+                    # BFS time even when the flag is on.
+                    if self.run_diagnostics:
+                        t_pause = time.perf_counter()
+                        snap = compute_liveness(g)
+                        snap['run_index'] = i
+                        snap['gen'] = gen
+                        liveness_snapshots.append(snap)
+                        start += (time.perf_counter() - t_pause)
                 if debug:
                     print(f"    [Gen {gen+1}] Generation's Breakpoints: {gen_bp}. Total so far: {total_grg_bp}")
             elapsed = time.perf_counter() - start
@@ -549,6 +573,45 @@ class RecombinationBenchmarker:
             self.diagnostics[file_path.name]["audit_aggregated"] = aggregated_audit
             self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
 
+        # ----- Liveness aggregation across (timed_runs * num_generations) snapshots -----
+        # Per-snapshot keys we average. dead_samples is a sanity counter (always 0 if
+        # the algorithm is correct); included so a non-zero average loudly fails.
+        # Aggregation + diagnostics stash run only when --diagnostics is on; when off,
+        # liveness_means stays zero-valued so the BenchmarkResult plumb below records
+        # 0.0 for the mean_dead_* columns (CSV stays well-formed).
+        liveness_keys = (
+            'total_nodes', 'alive', 'dead', 'dead_pct',
+            'num_samples', 'dead_samples', 'dead_roots',
+            'dead_with_mutations', 'dead_internal_empty', 'dead_mutation_count',
+        )
+        liveness_means = {k: 0.0 for k in liveness_keys}
+        liveness_by_gen = []
+
+        if self.run_diagnostics and liveness_snapshots:
+            n_snaps = len(liveness_snapshots)
+            liveness_means = {
+                k: sum(s[k] for s in liveness_snapshots) / n_snaps
+                for k in liveness_keys
+            }
+            # Per-generation averages (across timed runs, for each generation index).
+            by_gen = {}
+            for s in liveness_snapshots:
+                by_gen.setdefault(s['gen'], []).append(s)
+            for g_idx in sorted(by_gen):
+                snaps = by_gen[g_idx]
+                liveness_by_gen.append({
+                    'gen': g_idx,
+                    'snapshot_count': len(snaps),
+                    **{f'mean_{k}': sum(s[k] for s in snaps) / len(snaps) for k in liveness_keys},
+                })
+
+            self.diagnostics.setdefault(file_path.name, {})['liveness'] = {
+                'snapshot_count': n_snaps,
+                'snapshots': liveness_snapshots,
+                'means_over_all_snapshots': liveness_means,
+                'means_by_generation': liveness_by_gen,
+            }
+
         grg_mean, grg_std, grg_sizes_mean, grg_size_changes_mean = np.mean(grg_times), np.std(grg_times), np.mean(grg_sizes), np.mean(grg_size_changes)
         grg_bp_mean = total_grg_bp / (self.num_runs * self.num_generations)
         if not skip_numpy:
@@ -568,6 +631,9 @@ class RecombinationBenchmarker:
             nodes_added=nodes_added_per_run,
             edges_added=edges_added_per_run,
             memory_mb=grg_sizes_mean,
+            mean_dead_nodes=liveness_means['dead'],
+            mean_dead_pct=liveness_means['dead_pct'],
+            mean_dead_mutations=liveness_means['dead_mutation_count'],
         ))
 
         if not skip_numpy:
@@ -589,6 +655,32 @@ class RecombinationBenchmarker:
         print(f"  GRG Breakpoints: {grg_bp_mean:.2f} average breakpoints per generation")
         print(f"  GRG Memory:     {grg_sizes_mean:.1f} MB average resident memory")
         print(f"  Memory Delta:   +{grg_size_changes_mean:.1f} MB (GRG recombination memory increase), ")
+
+        # ----- Liveness (deadweight) averages -----
+        # Gated on --diagnostics; the snapshot-capture loop above no-ops when off,
+        # so liveness_snapshots is empty and we silently skip the print block.
+        if self.run_diagnostics and liveness_snapshots:
+            n_snaps = len(liveness_snapshots)
+            print(f"\n  Liveness (avg over {self.num_runs} timed runs * "
+                  f"{self.num_generations} gens = {n_snaps} snapshots):")
+            print(f"    mean total nodes (post-gen):  {liveness_means['total_nodes']:.2f}")
+            print(f"    mean alive nodes:             {liveness_means['alive']:.2f}")
+            print(f"    mean dead nodes:              {liveness_means['dead']:.2f}  "
+                  f"({liveness_means['dead_pct']:.1f}%)")
+            print(f"    mean dead w/ mutations:       {liveness_means['dead_with_mutations']:.2f}")
+            print(f"    mean dead empty internals:    {liveness_means['dead_internal_empty']:.2f}")
+            print(f"    mean dead roots:              {liveness_means['dead_roots']:.2f}")
+            print(f"    mean orphaned mutations:      {liveness_means['dead_mutation_count']:.2f}")
+            if liveness_means['dead_samples']:
+                print(f"    [!] mean dead_samples={liveness_means['dead_samples']:.2f} "
+                      f"(should be 0 -- algorithm sanity violation)")
+            if liveness_by_gen:
+                print(f"\n    Per-generation averages across {self.num_runs} timed runs:")
+                for entry in liveness_by_gen:
+                    print(f"      gen {entry['gen']+1}: "
+                          f"dead={entry['mean_dead']:.2f}  "
+                          f"pct={entry['mean_dead_pct']:.1f}%  "
+                          f"orphan_muts={entry['mean_dead_mutation_count']:.2f}")
         print()
 
         if not skip_numpy:

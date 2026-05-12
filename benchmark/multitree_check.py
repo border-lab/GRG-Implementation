@@ -41,11 +41,6 @@ from pathlib import Path
 import numpy as np
 import pygrgl
 
-from grg_recombination import (
-    NonDuplicationRecombination,
-    simulate_grg_recombination,
-)
-
 
 class BenchmarkStub:
     """Minimal stand-in for the benchmark instance that
@@ -125,6 +120,90 @@ def bfs_collect_ancestors(grg, start: int) -> set:
                 queue.append(p)
     visited.discard(start)
     return visited
+
+
+def compute_liveness(grg, samples=None, return_visited: bool = False) -> dict:
+    """Count nodes reachable upward from `samples` ("alive") vs not ("dead").
+
+    A node is alive if and only if it is an ancestor of (or equal to) at least
+    one node in `samples`. Anything else is "deadweight" the GRG carries
+    forward without contributing to any current sample's haplotype.
+
+    Single shared bytearray visited mask, all samples seeded at once -- one
+    BFS over the up-edges, not one per sample. O(|V| + |E|).
+
+    Args:
+        grg: pygrgl.MutableGRG (or any object exposing num_nodes,
+            get_up_edges, get_sample_nodes, is_sample, get_mutations_for_node).
+        samples: iterable of node IDs to seed from. Defaults to the GRG's
+            current sample set. Pass an explicit set to measure liveness
+            against arbitrary seeds (e.g. founder lineages) without touching
+            set_samples.
+        return_visited: if True, also include the visited bytearray in the
+            result under key 'visited' (useful for assertions in tests).
+
+    Returns a dict with: total_nodes, alive, dead, dead_pct, num_samples,
+    dead_samples, dead_roots, dead_with_mutations, dead_internal_empty,
+    dead_mutation_count. dead_samples must always be 0 (a sample reaches
+    itself trivially); a non-zero value indicates a malformed input."""
+    if samples is None:
+        samples = grg.get_sample_nodes()
+    samples = list(samples)
+
+    n = grg.num_nodes
+    visited = bytearray(n)
+    queue = deque()
+    for s in samples:
+        if 0 <= s < n and not visited[s]:
+            visited[s] = 1
+            queue.append(s)
+
+    while queue:
+        node = queue.popleft()
+        for p in grg.get_up_edges(node):
+            if not visited[p]:
+                visited[p] = 1
+                queue.append(p)
+
+    alive = sum(visited)
+    dead = n - alive
+
+    dead_samples = 0
+    dead_roots = 0
+    dead_with_mutations = 0
+    dead_internal_empty = 0
+    dead_mutation_count = 0
+
+    for node in range(n):
+        if visited[node]:
+            continue
+        if grg.is_sample(node):
+            dead_samples += 1
+        if not grg.get_up_edges(node):
+            dead_roots += 1
+        muts = grg.get_mutations_for_node(node)
+        num_muts = len(muts)
+        if num_muts:
+            dead_with_mutations += 1
+            dead_mutation_count += num_muts
+        else:
+            dead_internal_empty += 1
+
+    result = {
+        'total_nodes':         n,
+        'alive':               alive,
+        'dead':                dead,
+        'dead_pct':            (100.0 * dead / n) if n else 0.0,
+        'num_samples':         len(samples),
+        'dead_samples':        dead_samples,
+        'dead_roots':          dead_roots,
+        'dead_with_mutations': dead_with_mutations,
+        'dead_internal_empty': dead_internal_empty,
+        'dead_mutation_count': dead_mutation_count,
+    }
+    if return_visited:
+        result['visited'] = visited
+    return result
 
 
 def find_overlapping_ancestors(grg, parents: list) -> dict:
@@ -279,6 +358,10 @@ def main():
     print(f"Running one generation of recombination "
           f"(num_offspring_per_couple={args.offspring_per_couple})...")
     t = time.perf_counter()
+    from grg_recombination import (
+        NonDuplicationRecombination,
+        simulate_grg_recombination,
+    )
     recomb = NonDuplicationRecombination(grg)
     stub = BenchmarkStub(num_offspring_per_couple=args.offspring_per_couple)
     new_offspring_ids, total_bp = simulate_grg_recombination(
