@@ -103,6 +103,8 @@ class BenchmarkResult:
     mean_dead_nodes: float = 0.0
     mean_dead_pct: float = 0.0
     mean_dead_mutations: float = 0.0
+    mean_dead_edges: float = 0.0
+    mean_dead_edges_pct: float = 0.0
 
 @dataclass
 class SystemInfo:
@@ -583,6 +585,8 @@ class RecombinationBenchmarker:
             'total_nodes', 'alive', 'dead', 'dead_pct',
             'num_samples', 'dead_samples', 'dead_roots',
             'dead_with_mutations', 'dead_internal_empty', 'dead_mutation_count',
+            'total_edges', 'alive_alive_edges', 'dead_alive_edges',
+            'dead_dead_edges', 'dead_edges', 'dead_edges_pct',
         )
         liveness_means = {k: 0.0 for k in liveness_keys}
         liveness_by_gen = []
@@ -634,6 +638,8 @@ class RecombinationBenchmarker:
             mean_dead_nodes=liveness_means['dead'],
             mean_dead_pct=liveness_means['dead_pct'],
             mean_dead_mutations=liveness_means['dead_mutation_count'],
+            mean_dead_edges=liveness_means['dead_edges'],
+            mean_dead_edges_pct=liveness_means['dead_edges_pct'],
         ))
 
         if not skip_numpy:
@@ -671,6 +677,11 @@ class RecombinationBenchmarker:
             print(f"    mean dead empty internals:    {liveness_means['dead_internal_empty']:.2f}")
             print(f"    mean dead roots:              {liveness_means['dead_roots']:.2f}")
             print(f"    mean orphaned mutations:      {liveness_means['dead_mutation_count']:.2f}")
+            print(f"    mean total edges (post-gen):  {liveness_means['total_edges']:.2f}")
+            print(f"    mean dead edges:              {liveness_means['dead_edges']:.2f}  "
+                  f"({liveness_means['dead_edges_pct']:.1f}%)")
+            print(f"      dead-dead (both ends dead): {liveness_means['dead_dead_edges']:.2f}")
+            print(f"      dead-alive (dangling):      {liveness_means['dead_alive_edges']:.2f}")
             if liveness_means['dead_samples']:
                 print(f"    [!] mean dead_samples={liveness_means['dead_samples']:.2f} "
                       f"(should be 0 -- algorithm sanity violation)")

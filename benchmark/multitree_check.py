@@ -144,8 +144,21 @@ def compute_liveness(grg, samples=None, return_visited: bool = False) -> dict:
 
     Returns a dict with: total_nodes, alive, dead, dead_pct, num_samples,
     dead_samples, dead_roots, dead_with_mutations, dead_internal_empty,
-    dead_mutation_count. dead_samples must always be 0 (a sample reaches
-    itself trivially); a non-zero value indicates a malformed input."""
+    dead_mutation_count, total_edges, alive_alive_edges, dead_alive_edges,
+    dead_dead_edges, dead_edges, dead_edges_pct.
+
+    Edge classification: every (parent, child) edge in the GRG falls into
+    one of three buckets based on endpoint liveness:
+      - alive_alive_edges: both endpoints reachable from samples (useful).
+      - dead_alive_edges:  child dead, parent alive (dangling -- the live
+                           parent still has a down-edge to a stranded child).
+      - dead_dead_edges:   both endpoints dead (entirely in a dead subgraph).
+    The fourth combination (child alive, parent dead) is impossible: BFS-
+    upward from samples reaches every ancestor of every alive node, so an
+    alive child always has all-alive parents.
+
+    dead_samples must always be 0 (a sample reaches itself trivially); a
+    non-zero value indicates a malformed input."""
     if samples is None:
         samples = grg.get_sample_nodes()
     samples = list(samples)
@@ -173,13 +186,22 @@ def compute_liveness(grg, samples=None, return_visited: bool = False) -> dict:
     dead_with_mutations = 0
     dead_internal_empty = 0
     dead_mutation_count = 0
+    alive_alive_edges = 0
+    dead_alive_edges = 0
+    dead_dead_edges = 0
 
     for node in range(n):
+        parents = grg.get_up_edges(node)
         if visited[node]:
+            # By the BFS-upward invariant, every parent of an alive node is
+            # also alive -- no per-parent visit needed.
+            alive_alive_edges += len(parents)
             continue
+        # Dead node: classify content (sample/root/mut-bearing/empty) and
+        # bucket each up-edge by parent liveness.
         if grg.is_sample(node):
             dead_samples += 1
-        if not grg.get_up_edges(node):
+        if not parents:
             dead_roots += 1
         muts = grg.get_mutations_for_node(node)
         num_muts = len(muts)
@@ -188,6 +210,14 @@ def compute_liveness(grg, samples=None, return_visited: bool = False) -> dict:
             dead_mutation_count += num_muts
         else:
             dead_internal_empty += 1
+        for p in parents:
+            if visited[p]:
+                dead_alive_edges += 1
+            else:
+                dead_dead_edges += 1
+
+    total_edges = alive_alive_edges + dead_alive_edges + dead_dead_edges
+    dead_edges = dead_alive_edges + dead_dead_edges
 
     result = {
         'total_nodes':         n,
@@ -200,6 +230,12 @@ def compute_liveness(grg, samples=None, return_visited: bool = False) -> dict:
         'dead_with_mutations': dead_with_mutations,
         'dead_internal_empty': dead_internal_empty,
         'dead_mutation_count': dead_mutation_count,
+        'total_edges':         total_edges,
+        'alive_alive_edges':   alive_alive_edges,
+        'dead_alive_edges':    dead_alive_edges,
+        'dead_dead_edges':     dead_dead_edges,
+        'dead_edges':          dead_edges,
+        'dead_edges_pct':      (100.0 * dead_edges / total_edges) if total_edges else 0.0,
     }
     if return_visited:
         result['visited'] = visited
