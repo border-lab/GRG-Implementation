@@ -17,8 +17,12 @@ grgl
 # Ignore benchmark zip
 benchmark/recombination_benchmark.zip
 
-# Ignore markdown files from benchmark
+# Ignore markdown files and figures from benchmark
 benchmark/*.md
+benchmark/*.png
+benchmark/*.jpg
+benchmark/figures
+benchmark/generate_scaling_figures.py
 
 # Ignore testing scripts
 benchmark/*.sh
