@@ -15,6 +15,7 @@ import json
 import gc
 import sys
 import platform
+import tempfile
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -127,7 +128,8 @@ class RecombinationBenchmarker:
         memory_limit_mb: float = 15000.0,
         include_numpy: bool = True,
         verification: bool = False,
-        run_diagnostics: bool = False
+        run_diagnostics: bool = False,
+        serialize: bool = False
     ):
         self.grg_dir = grg_files_dir
         self.output_dir = output_dir
@@ -140,6 +142,7 @@ class RecombinationBenchmarker:
         self.include_numpy = include_numpy
         self.verification = verification
         self.run_diagnostics = run_diagnostics
+        self.serialize = serialize
         self.results = []
         # Always-initialized so that verification_checks (which is a separate
         # concern from --diagnostics) can stash per-file results without
@@ -199,6 +202,8 @@ class RecombinationBenchmarker:
               f"(structural stats + instrumented diagnostic pass + liveness/deadweight)")
         print(f"Verification: {'ON' if self.verification else 'OFF'} "
               f"(audit identities + multitree-violation check after each non-warmup run)")
+        print(f"Save+Reload measurement: {'ON' if self.serialize else 'OFF'} "
+              f"(one-shot save_grg+load_mutable_grg on final timed run, off the timed path)")
         print("=" * 80)
 
     def get_breakpoints(self, bp_range, expected_crossovers=1.5):
@@ -465,6 +470,63 @@ class RecombinationBenchmarker:
             grg_sizes.append(mem_after)
             grg_size_changes.append(mem_after - mem_before)
             print(f"  [Run {i+1}] Memory usage: {mem_after:.1f} MB (Delta: +{mem_after - mem_before:.1f} MB)")
+
+            # ----- One-shot save_grg + load_mutable_grg measurement -----
+            # Off the timed path (post-timing-loop, post-verification, pre-del).
+            # Runs only on the last timed iteration so I/O cost is paid once per file.
+            # Captures pre/post node+edge counts, save wallclock, load wallclock,
+            # and the on-disk file size for context.
+            if (self.serialize
+                    and i == (self.num_warmup + self.num_runs - 1)):
+                print(f"\n  [Run {i+1}] Running one-shot save_grg + load_mutable_grg...")
+                pre_nodes = g.num_nodes
+                pre_edges = g.num_edges
+                with tempfile.NamedTemporaryFile(suffix='.grg', delete=False) as _tf:
+                    sr_tmp_path = _tf.name
+                try:
+                    t0 = time.perf_counter()
+                    pygrgl.save_grg(g, sr_tmp_path)
+                    save_s = time.perf_counter() - t0
+                    file_size_mb = os.path.getsize(sr_tmp_path) / (1024 * 1024)
+
+                    t0 = time.perf_counter()
+                    g_reloaded = pygrgl.load_mutable_grg(sr_tmp_path)
+                    load_s = time.perf_counter() - t0
+
+                    post_nodes = g_reloaded.num_nodes
+                    post_edges = g_reloaded.num_edges
+                    node_delta = pre_nodes - post_nodes
+                    edge_delta = pre_edges - post_edges
+                    node_pct = 100.0 * node_delta / max(1, pre_nodes)
+                    edge_pct = 100.0 * edge_delta / max(1, pre_edges)
+                    total_s = save_s + load_s
+
+                    print(f"  [Save+Reload] pre:   {pre_nodes:>12,} nodes  {pre_edges:>12,} edges")
+                    print(f"  [Save+Reload] post:  {post_nodes:>12,} nodes  {post_edges:>12,} edges")
+                    print(f"  [Save+Reload] delta: -{node_delta:>11,} nodes (-{node_pct:5.2f}%)  "
+                          f"-{edge_delta:>11,} edges (-{edge_pct:5.2f}%)")
+                    print(f"  [Save+Reload] save: {save_s:.2f}s  load: {load_s:.2f}s  "
+                          f"total: {total_s:.2f}s  file: {file_size_mb:.1f} MB")
+
+                    self.diagnostics.setdefault(file_path.name, {})['save_reload_oneshot'] = {
+                        'pre_nodes': pre_nodes,
+                        'pre_edges': pre_edges,
+                        'post_nodes': post_nodes,
+                        'post_edges': post_edges,
+                        'node_reduction_pct': node_pct,
+                        'edge_reduction_pct': edge_pct,
+                        'save_s': save_s,
+                        'load_s': load_s,
+                        'total_s': total_s,
+                        'file_size_mb': file_size_mb,
+                        'measured_on_iteration': i,
+                    }
+                    del g_reloaded
+                finally:
+                    if os.path.exists(sr_tmp_path):
+                        os.remove(sr_tmp_path)
+                gc.collect()
+
             del g
             del recomb
 
@@ -692,6 +754,19 @@ class RecombinationBenchmarker:
                           f"dead={entry['mean_dead']:.2f}  "
                           f"pct={entry['mean_dead_pct']:.1f}%  "
                           f"orphan_muts={entry['mean_dead_mutation_count']:.2f}")
+
+        # ----- Save+Reload one-shot recap -----
+        # Brief restatement of the post-recombination save_grg+load_mutable_grg
+        # measurement (full numbers printed inline during the last timed run).
+        sr = self.diagnostics.get(file_path.name, {}).get('save_reload_oneshot')
+        if sr is not None:
+            print(f"\n  Save+Reload (one-shot, post-recomb, last timed run):")
+            print(f"    nodes:  {sr['pre_nodes']:>12,} -> {sr['post_nodes']:>12,}  "
+                  f"(-{sr['node_reduction_pct']:.2f}%)")
+            print(f"    edges:  {sr['pre_edges']:>12,} -> {sr['post_edges']:>12,}  "
+                  f"(-{sr['edge_reduction_pct']:.2f}%)")
+            print(f"    cost:   save {sr['save_s']:.2f}s + load {sr['load_s']:.2f}s "
+                  f"= {sr['total_s']:.2f}s  (file: {sr['file_size_mb']:.1f} MB)")
         print()
 
         if not skip_numpy:
@@ -883,6 +958,13 @@ if __name__ == "__main__":
                              "sample_depth distributions) and an extra fully-instrumented "
                              "diagnostic recomb pass (phase breakdowns, per-call C++ costs, "
                              "audit-1 decision-case histogram). Default off.")
+    parser.add_argument("--serialize", action="store_true",
+                        help="On the last timed run, after recombination completes, do a "
+                             "one-shot pygrgl.save_grg(g, tmp) + pygrgl.load_mutable_grg(tmp) "
+                             "and report pre/post (nodes, edges) plus save+load wallclock. "
+                             "Off the timed path; runs once per file. Use this to gauge how "
+                             "much the save-time simplifier (extraneous-node strip + CSR repack) "
+                             "shrinks the post-recombination graph. Default off.")
 
     args = parser.parse_args()
 
@@ -897,6 +979,7 @@ if __name__ == "__main__":
         include_numpy=not args.skip_numpy,
         verification=args.verification,
         run_diagnostics=args.diagnostics,
+        serialize=args.serialize,
     )
     
     benchmarker.run_benchmarks()
