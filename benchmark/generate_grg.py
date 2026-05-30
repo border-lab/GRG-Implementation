@@ -48,6 +48,16 @@ def _total_branch_length(ts) -> float:
     return float(((times[edges.parent] - times[edges.child]) * spans).sum())
 
 
+def _derive_segment_size(num_samples: int) -> int:
+    """N-aware segment_size for BuildShape. Constant segment_size produces
+    catastrophic fanout at high N (>>30 at 32k+ diploids on 100 Mbp); scaling
+    linearly with sample count keeps per-haplotype mutation signal above the
+    noise floor. Floor of 200 Kbp matches the paper's UKB-scale practice at
+    low N. Empirically validated 4k-64k diploids on 100 Mbp — see
+    [[vcf_vs_ts_recombination_comparison]]."""
+    return max(200_000, int(12.5 * num_samples))
+
+
 def _derive_construct_flags(
     sequence_length: int, segment_size: int, num_jobs: int
 ) -> tuple[int, int]:
@@ -73,7 +83,7 @@ def generate_grg(
     construct_jobs: int = 1,
     construct_trees: int | None = None,
     construct_parts: int | None = None,
-    segment_size: int = 100_000,
+    segment_size: int | None = None,
     keep_vcf: bool = False,
     input_trees: Path | None = None,
 ) -> tuple[Path, int]:
@@ -160,11 +170,19 @@ def generate_grg(
                 vcf_path = Path(tmpdir) / "sim.vcf"
             with open(vcf_path, "w") as fh:
                 ts.write_vcf(fh)
+            resolved_segment = (
+                segment_size if segment_size is not None
+                else _derive_segment_size(ts.num_samples)
+            )
             derived_t, derived_p = _derive_construct_flags(
-                int(ts.sequence_length), segment_size, construct_jobs,
+                int(ts.sequence_length), resolved_segment, construct_jobs,
             )
             trees = construct_trees if construct_trees is not None else derived_t
             parts = construct_parts if construct_parts is not None else derived_p
+            print(
+                f"  grg construct -t {trees} -p {parts} -j {construct_jobs} "
+                f"(segment_size={resolved_segment:,})"
+            )
             # cwd=tmpdir keeps `grg construct`'s per-part .grg shards out of
             # the user's cwd; --force skips the unindexed-VCF stop-warning.
             cmd = [
@@ -242,10 +260,12 @@ def main():
     parser.add_argument("--construct-parts", type=int, default=None,
                         help="Override for `grg construct -p` (--method vcf). "
                              "Default: min(--construct-jobs, derived T).")
-    parser.add_argument("--segment-size", type=int, default=100_000,
+    parser.add_argument("--segment-size", type=int, default=None,
                         help="Target segment size in bp used to derive "
-                             "`grg construct -t` (--method vcf). Paper "
-                             "recommends 50_000-150_000. Default: 100_000")
+                             "`grg construct -t` (--method vcf). "
+                             "Default: max(200_000, 12.5 * num_samples) — "
+                             "N-aware; constant segment_size blows fanout up "
+                             "at high N. Override only for sensitivity sweeps.")
     parser.add_argument("--keep-vcf", action="store_true",
                         help="Keep the intermediate VCF next to the output GRG "
                              "(--method vcf only).")
