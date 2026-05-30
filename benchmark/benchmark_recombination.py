@@ -129,7 +129,8 @@ class RecombinationBenchmarker:
         include_numpy: bool = True,
         verification: bool = False,
         run_diagnostics: bool = False,
-        serialize: bool = False
+        serialize: bool = False,
+        profile: bool = False,
     ):
         self.grg_dir = grg_files_dir
         self.output_dir = output_dir
@@ -143,6 +144,7 @@ class RecombinationBenchmarker:
         self.verification = verification
         self.run_diagnostics = run_diagnostics
         self.serialize = serialize
+        self.profile = profile
         self.results = []
         # Always-initialized so that verification_checks (which is a separate
         # concern from --diagnostics) can stash per-file results without
@@ -204,6 +206,8 @@ class RecombinationBenchmarker:
               f"(audit identities + multitree-violation check after each non-warmup run)")
         print(f"Save+Reload measurement: {'ON' if self.serialize else 'OFF'} "
               f"(one-shot save_grg+load_mutable_grg on final timed run, off the timed path)")
+        print(f"cProfile pass: {'ON' if self.profile else 'OFF'} "
+              f"(one generation under cProfile, top functions by cumtime + tottime)")
         print("=" * 80)
 
     def get_breakpoints(self, bp_range, expected_crossovers=1.5):
@@ -637,6 +641,56 @@ class RecombinationBenchmarker:
             self.diagnostics[file_path.name]["audit_aggregated"] = aggregated_audit
             self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
 
+        # ----- cProfile pass (one generation, fresh graph) -----
+        # Gated by --profile. Uses cProfile rather than manual perf_counter probes
+        # inside the hot loop, so there is no per-iteration overhead. The profiler
+        # accounts for time at function-call granularity, giving a breakdown across:
+        #   _recurse_attach (tottime = pure traversal; cumtime includes callees)
+        #   _get_node_and_ancestor_span  (ancestral interval DFS on cache miss)
+        #   _get_ancestral_coverage      (anc-cov cache miss path)
+        #   _get_up_edges_cached         (edge fetching)
+        #   _get_node_mutations          (mutation cache miss path)
+        #   _extract_bubble              (bubble creation)
+        #   _apply_pending_bubbles       (deferred mutation moves)
+        #   grg.connect / grg.make_node  (C++ boundary calls)
+        # Wall-clock here is NOT used for headline numbers.
+        if self.profile:
+            import cProfile
+            import pstats
+            import io
+
+            print(f"\nRunning cProfile pass (1 generation, fresh graph)...")
+            prof_g = pygrgl.load_mutable_grg(str(file_path))
+            prof_recomb = NonDuplicationRecombination(prof_g)
+
+            pr = cProfile.Profile()
+            pr.enable()
+            simulate_grg_recombination(self, prof_recomb, base_genome, N=base_genome[1])
+            pr.disable()
+
+            stream = io.StringIO()
+            ps = pstats.Stats(pr, stream=stream).strip_dirs()
+
+            ps.sort_stats('cumtime').print_stats(30)
+            cumtime_output = stream.getvalue()
+            stream.seek(0); stream.truncate(0)
+
+            ps.sort_stats('tottime').print_stats(30)
+            tottime_output = stream.getvalue()
+
+            print(f"\n--- cProfile: top 30 by cumulative time ---")
+            print(cumtime_output)
+            print(f"--- cProfile: top 30 by total time (self only, excludes callees) ---")
+            print(tottime_output)
+
+            self.diagnostics.setdefault(file_path.name, {})['profile'] = {
+                'cumtime_top30': cumtime_output,
+                'tottime_top30': tottime_output,
+            }
+
+            del prof_g, prof_recomb
+            gc.collect()
+
         # ----- Liveness aggregation across (timed_runs * num_generations) snapshots -----
         # Per-snapshot keys we average. dead_samples is a sanity counter (always 0 if
         # the algorithm is correct); included so a non-zero average loudly fails.
@@ -920,6 +974,7 @@ class RecombinationBenchmarker:
                     "memory_limit_mb": self.memory_limit_mb,
                     "num_generations": self.num_generations,
                     "num_offspring_per_couple": self.num_offspring_per_couple,
+                    "profile": self.profile,
                 },
                 "results": [asdict(r) for r in self.results],
                 "diagnostics": getattr(self, "diagnostics", {}),
@@ -965,6 +1020,14 @@ if __name__ == "__main__":
                              "Off the timed path; runs once per file. Use this to gauge how "
                              "much the save-time simplifier (extraneous-node strip + CSR repack) "
                              "shrinks the post-recombination graph. Default off.")
+    parser.add_argument("--profile", action="store_true",
+                        help="After timed runs, load the graph fresh and run one generation "
+                             "under cProfile. Prints top 30 functions by cumulative time "
+                             "(cumtime = function + callees) and by self time (tottime = "
+                             "function body only, excluding callees). cumtime identifies the "
+                             "costliest call chains; tottime isolates where CPU is actually "
+                             "spent (e.g. pure traversal in _recurse_attach vs cache-miss DFS "
+                             "in _get_node_and_ancestor_span). Off the timed path. Default off.")
 
     args = parser.parse_args()
 
@@ -980,6 +1043,7 @@ if __name__ == "__main__":
         verification=args.verification,
         run_diagnostics=args.diagnostics,
         serialize=args.serialize,
+        profile=args.profile,
     )
     
     benchmarker.run_benchmarks()
