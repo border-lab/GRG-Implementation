@@ -10,8 +10,9 @@ benchmark/output
 benchmark/.venv
 .venv
 
-# Ignore local grgl package
+# Ignore local grgl package and testing
 benchmark/grgl
+benchmark/_debug_serialize_crash.py
 grgl
 
 # Ignore benchmark zip
