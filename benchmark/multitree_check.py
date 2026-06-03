@@ -74,23 +74,44 @@ class BenchmarkStub:
 
 
 def compute_post_recomb_anc_counts(grg) -> list:
-    """Per-node multitree-assumed ancestor count on the post-recomb GRG.
+    """Per-node true ancestor count on the post-recomb GRG via Kahn's
+    topological-order DP.
 
-    Iterates high-to-low over all node IDs. For pre-existing nodes (whose
-    multitree property is preserved by recomb -- bubbles add no overlap),
-    this equals the true |ancestors(v)|. For bubbles, this is 0 (no
-    up-edges). For offspring, the value is meaningless because some of their
-    parents have lower IDs and aren't yet processed when they're visited;
-    that's fine because offspring are leaves and nothing references them
-    upward. The caller computes `expected` for offspring directly from
-    parents' (correct) values, never from the offspring's own slot."""
+    For each node v in topological order (parents-before-children):
+        anc_count[v] = Σ_p (1 + anc_count[p])  over up-edges p
+
+    This equals |ancestors(v)| iff the *post-recomb* DAG is a multitree
+    (parents' ancestor sets are disjoint); otherwise it overcounts, and the
+    overcount is exactly the number of redundant paths in the diamond.
+
+    Why topo-order, not ID-order: pre-recomb GRGs have parents at higher IDs,
+    so iterating high-to-low works. Post-recomb, direct-attach and
+    path-compression-attach add edges where the offspring (high ID) has a
+    pre-existing parent (low ID). In multi-generation runs, the gen-1
+    offspring then becomes a parent of a gen-2 offspring, so gen-1 offspring
+    anc_counts get read -- and the ID-based DP undercounts them whenever
+    they have low-ID pre-existing parents.
+
+    Implementation: Kahn's algorithm seeded from true roots (no up-edges),
+    propagating along down-edges. O(|V| + |E|)."""
     n = grg.num_nodes
     anc_count = [0] * n
-    for v in range(n - 1, -1, -1):
+    indeg = [0] * n
+    for v in range(n):
+        indeg[v] = len(grg.get_up_edges(v))
+
+    queue = deque(v for v in range(n) if indeg[v] == 0)
+
+    while queue:
+        v = queue.popleft()
         total = 0
         for p in grg.get_up_edges(v):
             total += 1 + anc_count[p]
         anc_count[v] = total
+        for c in grg.get_down_edges(v):
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                queue.append(c)
     return anc_count
 
 

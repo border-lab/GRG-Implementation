@@ -948,6 +948,13 @@ def simulate_grg_recombination(benchmark, recomb, bp_range, N):
         recomb.grg.sort_mutations()
         if recomb.instrument:
             recomb.stats["sort_mutations_time"] += time.perf_counter() - t_sort
+        # sort_mutations renumbers MutationIds (by (position, allele)), so any
+        # cached (mut_id, position) pairs from this generation are now stale.
+        # Position-derived caches (span_cache, anc_cov_cache, _up_edges_cache)
+        # are unaffected and survive. Lazy repopulation on first touch in the
+        # next generation.
+        recomb._mutation_cache.clear()
+        recomb._pos_cache.clear()
     finally:
         recomb.defer_sample_updates = prev_defer
 

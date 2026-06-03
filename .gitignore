@@ -27,3 +27,6 @@ benchmark/generate_scaling_figures.py
 # Ignore testing scripts
 benchmark/*.sh
 benchmark/*.slurm
+
+# Ignore pdfs
+*.pdf
