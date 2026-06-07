@@ -586,6 +586,14 @@ class RecombinationBenchmarker:
             print(f"\nRunning instrumented diagnostic pass...")
             diag_g = pygrgl.load_mutable_grg(str(file_path))
             diag_recomb = NonDuplicationRecombination(diag_g, instrument=True)
+            # _build_ancestral_caches runs in __init__ and writes
+            # init_caches_time into stats. Capture it now -- the first
+            # reset_stats() below would zero it out, and the init pass is
+            # a one-time construction cost that doesn't belong in per-gen
+            # snapshots anyway.
+            init_caches_time_s = diag_recomb.stats["init_caches_time"]
+            print(f"  [Diag] One-pass cache init: {init_caches_time_s:.2f}s "
+                  f"(amortized across {self.num_generations} gen(s))")
             per_generation_stats = []
             diag_total_start = time.perf_counter()
             for gen in range(self.num_generations):
@@ -651,6 +659,9 @@ class RecombinationBenchmarker:
             self.diagnostics.setdefault(file_path.name, {})["per_generation"] = per_generation_stats
             self.diagnostics[file_path.name]["audit_aggregated"] = aggregated_audit
             self.diagnostics[file_path.name]["diagnostic_total_wallclock_s"] = diag_total
+            # One-time __init__ cost for the topological cache prebuild
+            # (separate from per_generation since it doesn't recur per gen).
+            self.diagnostics[file_path.name]["init_caches_time_s"] = init_caches_time_s
 
         # ----- cProfile pass (one generation, fresh graph) -----
         # Gated by --profile. Uses cProfile rather than manual perf_counter probes

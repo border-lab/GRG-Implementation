@@ -107,6 +107,14 @@ class NonDuplicationRecombination:
       in later segments produces only pruning_root events. Filter is
       per-offspring (gen_c bumps per recombine call), so bubbles from
       previous offspring remain reachable for legitimate reuse.
+    - One-pass O(V + E) Kahn's-algorithm initialization of all per-node
+      caches in `_build_ancestral_caches`, run once at construction.
+      Every node in the input graph gets _up_edges_cache, _mutation_cache,
+      _pos_cache, span_cache, and anc_cov_cache populated up-front, so
+      `_recurse_attach` hits the fast cache path on first access. The
+      lazy fallbacks in `_get_node_and_ancestor_span` and
+      `_get_ancestral_coverage` still handle nodes created later (bubbles,
+      offspring) and re-populated entries after `_clear_modified_caches`.
     """
 
     debug_mode = False
@@ -152,6 +160,15 @@ class NonDuplicationRecombination:
         # dict op, dominated by surrounding work.
         self.audit = self._fresh_audit()
 
+        # ----- One-pass cache initialization -----
+        # Populate per-node caches for every node in the input graph in a
+        # single O(V + E) Kahn's-algorithm sweep. After this returns, the
+        # hot loop in `_recurse_attach` hits the fast cache path on its
+        # first access to any input-graph node, instead of triggering the
+        # lazy DFS in `_get_node_and_ancestor_span`. Nodes created later
+        # (bubbles, offspring) still use the lazy paths.
+        self._build_ancestral_caches()
+
     @staticmethod
     def _fresh_audit():
         return {
@@ -190,6 +207,7 @@ class NonDuplicationRecombination:
     def _fresh_stats():
         return {
             # Phase-level wallclock totals (seconds)
+            "init_caches_time": 0.0,
             "recurse_attach_time": 0.0,
             "apply_bubbles_time": 0.0,
             "sync_to_grg_time": 0.0,
@@ -249,6 +267,138 @@ class NonDuplicationRecombination:
             self._grow_node_arrays(n - 1)
 
     # ------------------------------------------------------------------
+    # One-pass cache initialization (Kahn's topological sort)
+    # ------------------------------------------------------------------
+
+    def _build_ancestral_caches(self):
+        """
+        One-pass O(V + E) initialization of every per-node cache for the
+        input graph. Replaces lazy cache-miss DFS in the hot path with
+        up-front amortized work.
+
+        Algorithm (Kahn's topological sort, roots -> samples direction):
+          1. For every node, compute in_degree = |get_up_edges(node)|.
+             Populate _up_edges_cache in the same loop.
+          2. Seed a queue with all in_degree == 0 nodes (roots).
+          3. Pop a node, fill its caches from already-cached parents:
+                - _mutation_cache / _pos_cache from own mutations
+                - span_cache = own muts U union(parent.span_cache)
+                - anc_cov_cache = union(parent.span_cache) with max+1,
+                                  None if no parents
+          4. Decrement in_degree of each child via get_down_edges(node);
+             enqueue any child whose in_degree reaches 0.
+
+        Correctness rests on the topological-order invariant: every parent
+        is popped before any of its children, so its span_cache is always
+        available when the child needs it. The GRG is a DAG, so the sort
+        always completes.
+
+        Portability notes (this method is the prime candidate for a C++
+        port alongside _recurse_attach):
+          - in_degree         -> std::vector<int>
+          - queue             -> std::queue<int> or std::deque<int>
+          - span/anc_cov      -> std::vector<std::optional<std::pair<int,int>>>
+          - mutation/pos      -> std::vector<std::vector<...>>
+          - up_edges          -> std::vector<std::vector<int>>
+        Inner-loop logic is straight integer arithmetic and vector access;
+        no Python-specific idioms.
+
+        Lazy fallback paths in _get_node_and_ancestor_span and
+        _get_ancestral_coverage are intentionally retained: they handle
+        bubbles + offspring created mid-recombination, and re-populate
+        nodes evicted by _clear_modified_caches.
+        """
+        instrument = self.instrument
+        if instrument:
+            t_start = time.perf_counter()
+
+        n = self.grg.num_nodes
+        if n == 0:
+            if instrument:
+                self.stats["init_caches_time"] += time.perf_counter() - t_start
+            return
+
+        grg = self.grg
+        up_edges_cache = self._up_edges_cache
+        mutation_cache = self._mutation_cache
+        pos_cache = self._pos_cache
+        span_cache = self.span_cache
+        anc_cov_cache = self.anc_cov_cache
+
+        # Pass 1: in-degree + populate _up_edges_cache.
+        in_degree = [0] * n
+        for node in range(n):
+            parents = list(grg.get_up_edges(node))
+            up_edges_cache[node] = parents
+            in_degree[node] = len(parents)
+
+        # Seed: roots (no parents) are immediately processable.
+        queue = deque(node for node in range(n) if in_degree[node] == 0)
+        INF_POS = float('inf')
+        NEG_INF_POS = float('-inf')
+
+        # Pass 2: topological processing.
+        while queue:
+            node = queue.popleft()
+
+            # ---- Populate mutation caches ----
+            # Inlined from _get_node_mutations to avoid the dict-membership
+            # check on every call during the init pass.
+            mut_ids = grg.get_mutations_for_node(node, allow_sort=False)
+            mutations = []
+            for mut_id in mut_ids:
+                mut = grg.get_mutation_by_id(mut_id)
+                mutations.append((mut_id, mut.position))
+            if len(mutations) > 1:
+                mutations.sort(key=lambda x: x[1])
+            mutation_cache[node] = mutations
+            pos_cache[node] = [m[1] for m in mutations]
+
+            # ---- Compute span_cache[node] ----
+            # = own mutations' (min_pos, max_pos) U each parent's span_cache.
+            if mutations:
+                min_p = mutations[0][1]
+                max_p = mutations[-1][1]
+            else:
+                min_p = INF_POS
+                max_p = NEG_INF_POS
+
+            parents = up_edges_cache[node]
+            for parent in parents:
+                p_span = span_cache[parent]
+                if p_span:  # not None (we never see False here in topo order)
+                    if p_span[0] < min_p: min_p = p_span[0]
+                    if p_span[1] > max_p: max_p = p_span[1]
+
+            span_cache[node] = None if min_p == INF_POS else (min_p, max_p)
+
+            # ---- Compute anc_cov_cache[node] ----
+            # = union of parents' span_cache (with +1 on max), excluding
+            # this node's own mutations. None if node has no parents.
+            if not parents:
+                anc_cov_cache[node] = None
+            else:
+                anc_min = INF_POS
+                anc_max = NEG_INF_POS
+                for parent in parents:
+                    p_span = span_cache[parent]
+                    if p_span:
+                        if p_span[0] < anc_min: anc_min = p_span[0]
+                        if p_span[1] > anc_max: anc_max = p_span[1]
+                anc_cov_cache[node] = (
+                    None if anc_min == INF_POS else (anc_min, anc_max + 1)
+                )
+
+            # ---- Release children whose final parent just finished ----
+            for child in grg.get_down_edges(node):
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+
+        if instrument:
+            self.stats["init_caches_time"] += time.perf_counter() - t_start
+
+    # ------------------------------------------------------------------
     # Cached graph access
     # ------------------------------------------------------------------
 
@@ -270,9 +420,13 @@ class NonDuplicationRecombination:
             for mut_id in mut_ids:
                 mut = self.grg.get_mutation_by_id(mut_id)
                 mutations.append((mut_id, mut.position))
-            combined = sorted(mutations, key=lambda x: x[1])
-            self._mutation_cache[node_id] = combined
-            self._pos_cache[node_id] = [m[1] for m in combined]
+            # p50 mutations/node is 0 across all benchmarked files; skipping
+            # the sort on the 0/1-item common case avoids the sorted() call
+            # overhead (was ~7-19% of total runtime depending on scale).
+            if len(mutations) > 1:
+                mutations.sort(key=lambda x: x[1])
+            self._mutation_cache[node_id] = mutations
+            self._pos_cache[node_id] = [m[1] for m in mutations]
         return self._mutation_cache[node_id]
 
     def _get_mutation_range(self, node_id, L, R):
