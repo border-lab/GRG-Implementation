@@ -24,11 +24,20 @@ import re
 import psutil
 
 # Import our custom modules (ensure these are in the same directory)
-from grg_recombination import (
-    simulate_grg_recombination,
-    NonDuplicationRecombination,
-    compute_grg_structural_stats,
-)
+#
+# Backend selection: GRG_BACKEND=cpp routes through the native C++ recombiner
+# (grg_recombination_native.NonDuplicationRecombination, which wraps
+# grg_recomb_native.NonDuplicationRecombiner). The Python interface, audit
+# dict, stats dict, and JSON output are identical -- the benchmark stack is
+# backend-agnostic.
+from grg_recombination import simulate_grg_recombination, compute_grg_structural_stats
+
+if os.environ.get("GRG_BACKEND", "python").lower() in ("cpp", "c++", "native"):
+    from grg_recombination_native import NonDuplicationRecombination
+
+    print("Using C++ recombination backend (grg_recombination_native).")
+else:
+    from grg_recombination import NonDuplicationRecombination
 from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
 from multitree_check import compute_post_recomb_anc_counts, check_offspring, compute_liveness
 

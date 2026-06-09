@@ -244,6 +244,29 @@ class NonDuplicationRecombination:
         """Zero only the audit counters (leaves stats untouched)."""
         self.audit = self._fresh_audit()
 
+    def clear_pending_sample_removals(self):
+        """Drop accumulated pending-sample-removals (e.g. after a wholesale
+        grg.set_samples() makes them moot)."""
+        self._pending_sample_removals.clear()
+
+    def end_generation(self):
+        """End-of-generation hook. Calls grg.sort_mutations() (compacts
+        soft-deleted entries), then clears mutation_cache + pos_cache because
+        sort_mutations renumbers MutationIds. Position-derived caches
+        (span_cache, anc_cov_cache, _up_edges_cache) intentionally survive.
+        Records sort_mutations_time when instrumented.
+
+        Defined on both the Python class and the C++ wrapper so
+        simulate_grg_recombination is backend-agnostic.
+        """
+        if self.instrument:
+            t_sort = time.perf_counter()
+        self.grg.sort_mutations()
+        if self.instrument:
+            self.stats["sort_mutations_time"] += time.perf_counter() - t_sort
+        self._mutation_cache.clear()
+        self._pos_cache.clear()
+
     # ------------------------------------------------------------------
     # Per-node array growth
     # ------------------------------------------------------------------
@@ -1092,23 +1115,12 @@ def simulate_grg_recombination(benchmark, recomb, bp_range, N):
         new_offspring_ids.sort()
         recomb.grg.set_samples(new_offspring_ids)
         # Wholesale set_samples just made every accumulated removal moot.
-        recomb._pending_sample_removals.clear()
+        recomb.clear_pending_sample_removals()
 
-        # Compact soft-deleted mutation entries left behind by remove_mutation
-        # (now O(1) with the new API). Without this, get_mutations_for_node
-        # walks past the dead entries on every read at heavily-modified nodes.
-        if recomb.instrument:
-            t_sort = time.perf_counter()
-        recomb.grg.sort_mutations()
-        if recomb.instrument:
-            recomb.stats["sort_mutations_time"] += time.perf_counter() - t_sort
-        # sort_mutations renumbers MutationIds (by (position, allele)), so any
-        # cached (mut_id, position) pairs from this generation are now stale.
-        # Position-derived caches (span_cache, anc_cov_cache, _up_edges_cache)
-        # are unaffected and survive. Lazy repopulation on first touch in the
-        # next generation.
-        recomb._mutation_cache.clear()
-        recomb._pos_cache.clear()
+        # Compact soft-deleted mutation entries + invalidate mutation-id-keyed
+        # caches (sort_mutations renumbers MutationIds; position-derived caches
+        # survive because positions don't change).
+        recomb.end_generation()
     finally:
         recomb.defer_sample_updates = prev_defer
 
