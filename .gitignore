@@ -20,6 +20,7 @@ benchmark/recombination_benchmark.zip
 
 # Ignore markdown files and figures from benchmark
 benchmark/*.md
+benchmark/native/*.md
 benchmark/*.png
 benchmark/*.jpg
 benchmark/figures
