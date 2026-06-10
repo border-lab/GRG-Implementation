@@ -37,6 +37,7 @@ NonDuplicationRecombiner::NonDuplicationRecombiner(MutableGRGPtr grg, bool instr
       m_genomeLength(0),
       m_genVisited(0),
       m_genConnected(0),
+      m_inputGraphNodeCount(0),
       m_audit(),
       m_stats(),
       m_instrument(instrument),
@@ -48,6 +49,7 @@ NonDuplicationRecombiner::NonDuplicationRecombiner(MutableGRGPtr grg, bool instr
     m_genomeLength = m_grg->getBPRange().second;
 
     const size_t n = m_grg->numNodes();
+    m_inputGraphNodeCount = n;
     m_spanCache.resize(n);   // default-constructed -> Uninit
     m_ancCovCache.resize(n); // default-constructed -> Uninit
     m_visitedGen.resize(n, 0);
@@ -57,18 +59,18 @@ NonDuplicationRecombiner::NonDuplicationRecombiner(MutableGRGPtr grg, bool instr
 }
 
 // One-pass O(V + E) Kahn's-sort initialization of every per-node cache.
-// Direct port of Python _build_ancestral_caches; see its docstring for the
-// algorithm and correctness argument.
 //
-// After this returns, every node in the input graph has:
-//   m_spanCache[node]   = Set(min_pos, max_pos) over node's own + ancestors' mutations,
-//                          or Empty if neither has any mutations
-//   m_ancCovCache[node] = Set(anc_min, anc_max + 1) over parents' span unions,
-//                          or Empty if node has no parents (root)
-//   m_upEdgesCache[node], m_mutationCache[node], m_posCache[node] populated
+// Builds the input-graph CSR arrays:
+//   m_inputUpEdges + m_inputUpEdgesOffsets   (parent lists, flat)
+//   m_inputMutIds + m_inputPos + m_inputMutOffsets (mutation IDs + positions,
+//                                                   parallel, sorted by
+//                                                   position within each node)
+// plus the dense per-node interval caches m_spanCache / m_ancCovCache.
 //
-// Lazy fallbacks in getNodeAndAncestorSpan / getAncestralCoverage handle
-// bubbles + offspring created mid-recombination.
+// Replaces the previous hash-keyed caches (m_mutationCache, m_posCache,
+// m_upEdgesCache); see DESIGN.md "Cache flattening to SoA" for motivation.
+// Bubble / offspring nodes created mid-run live in m_overrideMutIds /
+// m_overridePos / m_overrideUpEdges instead.
 void NonDuplicationRecombiner::buildAncestralCaches() {
     std::chrono::steady_clock::time_point tStart;
     if (m_instrument) {
@@ -83,13 +85,26 @@ void NonDuplicationRecombiner::buildAncestralCaches() {
         return;
     }
 
-    // Pass 1: populate _up_edges_cache and compute in-degrees.
+    // Pass 1: fetch up-edges into a temporary, compute in-degrees, then build
+    // the flat CSR. We can't avoid the per-node getUpEdges() copy (the API
+    // returns by value), but flattening into m_inputUpEdges drops one
+    // allocation per node compared to the old hash-map layout.
+    std::vector<NodeIDList> upEdgesTmp(n);
     std::vector<uint32_t> inDegree(n, 0);
+    m_inputUpEdgesOffsets.assign(n + 1, 0);
     for (NodeID node = 0; node < n; node++) {
-        NodeIDList parents = m_grg->getUpEdges(node);
-        const size_t fanin = parents.size();
-        m_upEdgesCache[node] = std::vector<NodeID>(parents.begin(), parents.end());
+        upEdgesTmp[node] = m_grg->getUpEdges(node);
+        const size_t fanin = upEdgesTmp[node].size();
         inDegree[node] = static_cast<uint32_t>(fanin);
+        m_inputUpEdgesOffsets[node + 1] = m_inputUpEdgesOffsets[node] + fanin;
+    }
+    m_inputUpEdges.resize(m_inputUpEdgesOffsets[n]);
+    for (NodeID node = 0; node < n; node++) {
+        const size_t off = m_inputUpEdgesOffsets[node];
+        const NodeIDList& parents = upEdgesTmp[node];
+        for (size_t i = 0; i < parents.size(); i++) {
+            m_inputUpEdges[off + i] = parents[i];
+        }
     }
 
     // Seed: roots (no parents) are immediately processable.
@@ -100,43 +115,49 @@ void NonDuplicationRecombiner::buildAncestralCaches() {
         }
     }
 
-    // Pass 2: topological processing.
+    // Pass 2 (Kahn's topological sweep): for each node compute its sorted
+    // mutation list (stored temporarily) and its span / anc_cov caches.
+    // The parent's span is already computed by Kahn's invariant.
+    std::vector<std::vector<MutationId>> mutIdsTmp(n);
+    std::vector<std::vector<BpPosition>> posTmp(n);
+
     while (!queue.empty()) {
         const NodeID node = queue.front();
         queue.pop_front();
 
-        // ---- Populate mutation caches (inlined from getNodeMutations) ----
-        std::vector<MutationId> mutIds = m_grg->getMutationsForNode<MutationId>(node, /*allowSort=*/false);
-        std::vector<std::pair<MutationId, BpPosition>> mutations;
-        mutations.reserve(mutIds.size());
-        for (MutationId mid : mutIds) {
+        // ---- Build sorted (mutationId, position) for `node` ----
+        std::vector<MutationId> rawMutIds = m_grg->getMutationsForNode<MutationId>(node, /*allowSort=*/false);
+        std::vector<std::pair<MutationId, BpPosition>> mutPairs;
+        mutPairs.reserve(rawMutIds.size());
+        for (MutationId mid : rawMutIds) {
             const Mutation& mut = m_grg->getMutationById(mid);
-            mutations.emplace_back(mid, mut.getPosition());
+            mutPairs.emplace_back(mid, mut.getPosition());
         }
-        if (mutations.size() > 1) {
-            std::sort(mutations.begin(),
-                      mutations.end(),
+        if (mutPairs.size() > 1) {
+            std::sort(mutPairs.begin(),
+                      mutPairs.end(),
                       [](const std::pair<MutationId, BpPosition>& a, const std::pair<MutationId, BpPosition>& b) {
                           return a.second < b.second;
                       });
         }
-        std::vector<BpPosition> positions;
-        positions.reserve(mutations.size());
-        for (const auto& m : mutations) {
-            positions.push_back(m.second);
+        mutIdsTmp[node].reserve(mutPairs.size());
+        posTmp[node].reserve(mutPairs.size());
+        for (const std::pair<MutationId, BpPosition>& mp : mutPairs) {
+            mutIdsTmp[node].push_back(mp.first);
+            posTmp[node].push_back(mp.second);
         }
 
         // ---- Compute span_cache[node] = own muts (min,max) U each parent's span ----
         BpPosition minP = NO_POS_SENTINEL;
         BpPosition maxP = 0;
         bool anySet = false;
-        if (!mutations.empty()) {
-            minP = mutations.front().second;
-            maxP = mutations.back().second;
+        if (!posTmp[node].empty()) {
+            minP = posTmp[node].front();
+            maxP = posTmp[node].back();
             anySet = true;
         }
 
-        const std::vector<NodeID>& parents = m_upEdgesCache[node];
+        const NodeIDList& parents = upEdgesTmp[node];
         for (NodeID parent : parents) {
             const IntervalOpt& pSpan = m_spanCache[parent];
             if (pSpan.isSet()) {
@@ -184,9 +205,6 @@ void NonDuplicationRecombiner::buildAncestralCaches() {
             m_ancCovCache[node] = anyAnc ? IntervalOpt::makeSet(ancMin, ancMax + 1) : IntervalOpt::makeEmpty();
         }
 
-        m_mutationCache[node] = std::move(mutations);
-        m_posCache[node] = std::move(positions);
-
         // ---- Release children whose final parent just finished ----
         NodeIDList children = m_grg->getDownEdges(node);
         for (NodeID child : children) {
@@ -194,6 +212,23 @@ void NonDuplicationRecombiner::buildAncestralCaches() {
             if (inDegree[child] == 0) {
                 queue.push_back(child);
             }
+        }
+    }
+
+    // Pass 3: flatten per-node mutation lists into the CSR.
+    m_inputMutOffsets.assign(n + 1, 0);
+    for (NodeID node = 0; node < n; node++) {
+        m_inputMutOffsets[node + 1] = m_inputMutOffsets[node] + posTmp[node].size();
+    }
+    m_inputMutIds.resize(m_inputMutOffsets[n]);
+    m_inputPos.resize(m_inputMutOffsets[n]);
+    for (NodeID node = 0; node < n; node++) {
+        const size_t off = m_inputMutOffsets[node];
+        const std::vector<MutationId>& mids = mutIdsTmp[node];
+        const std::vector<BpPosition>& pos = posTmp[node];
+        for (size_t i = 0; i < mids.size(); i++) {
+            m_inputMutIds[off + i] = mids[i];
+            m_inputPos[off + i] = pos[i];
         }
     }
 
@@ -226,50 +261,90 @@ void NonDuplicationRecombiner::syncToGrg() {
 }
 
 // ------------------------------------------------------------------
-// Cached graph access (lazy fallbacks for nodes created mid-recombination)
+// Cache access: CSR for input-graph nodes, override map for new/modified
+// nodes. Spans are non-owning views; see Span<T> doc for invalidation rules.
 // ------------------------------------------------------------------
 
-const std::vector<NodeID>& NonDuplicationRecombiner::getUpEdgesCached(NodeID nodeId) {
-    auto it = m_upEdgesCache.find(nodeId);
-    if (it != m_upEdgesCache.end()) {
-        return it->second;
-    }
-    NodeIDList parents = m_grg->getUpEdges(nodeId);
-    auto inserted = m_upEdgesCache.emplace(nodeId, std::vector<NodeID>(parents.begin(), parents.end()));
-    return inserted.first->second;
-}
-
-const std::vector<std::pair<MutationId, BpPosition>>& NonDuplicationRecombiner::getNodeMutations(NodeID nodeId) {
-    auto it = m_mutationCache.find(nodeId);
-    if (it != m_mutationCache.end()) {
-        return it->second;
-    }
-
-    std::vector<MutationId> mutIds = m_grg->getMutationsForNode<MutationId>(nodeId, /*allowSort=*/false);
-    std::vector<std::pair<MutationId, BpPosition>> mutations;
-    mutations.reserve(mutIds.size());
-    for (MutationId mid : mutIds) {
+void NonDuplicationRecombiner::populateMutationOverride(NodeID nodeId) {
+    std::vector<MutationId> rawMutIds = m_grg->getMutationsForNode<MutationId>(nodeId, /*allowSort=*/false);
+    std::vector<std::pair<MutationId, BpPosition>> mutPairs;
+    mutPairs.reserve(rawMutIds.size());
+    for (MutationId mid : rawMutIds) {
         const Mutation& mut = m_grg->getMutationById(mid);
-        mutations.emplace_back(mid, mut.getPosition());
+        mutPairs.emplace_back(mid, mut.getPosition());
     }
     // p50 mutations/node is 0 across all benchmarked files; skip the sort on
     // the 0/1-item common case to match the Python optimization.
-    if (mutations.size() > 1) {
-        std::sort(mutations.begin(),
-                  mutations.end(),
+    if (mutPairs.size() > 1) {
+        std::sort(mutPairs.begin(),
+                  mutPairs.end(),
                   [](const std::pair<MutationId, BpPosition>& a, const std::pair<MutationId, BpPosition>& b) {
                       return a.second < b.second;
                   });
     }
+    std::vector<MutationId> mids;
     std::vector<BpPosition> positions;
-    positions.reserve(mutations.size());
-    for (const auto& m : mutations) {
-        positions.push_back(m.second);
+    mids.reserve(mutPairs.size());
+    positions.reserve(mutPairs.size());
+    for (const std::pair<MutationId, BpPosition>& mp : mutPairs) {
+        mids.push_back(mp.first);
+        positions.push_back(mp.second);
     }
+    m_overrideMutIds[nodeId] = std::move(mids);
+    m_overridePos[nodeId] = std::move(positions);
+}
 
-    m_posCache[nodeId] = std::move(positions);
-    auto inserted = m_mutationCache.emplace(nodeId, std::move(mutations));
-    return inserted.first->second;
+void NonDuplicationRecombiner::populateUpEdgesOverride(NodeID nodeId) {
+    NodeIDList parents = m_grg->getUpEdges(nodeId);
+    m_overrideUpEdges[nodeId] = std::vector<NodeID>(parents.begin(), parents.end());
+}
+
+Span<BpPosition> NonDuplicationRecombiner::getPositionsView(NodeID nodeId) {
+    auto it = m_overridePos.find(nodeId);
+    if (it != m_overridePos.end()) {
+        return Span<BpPosition>(it->second.data(), it->second.size());
+    }
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        const size_t lo = m_inputMutOffsets[nodeId];
+        const size_t hi = m_inputMutOffsets[nodeId + 1];
+        return Span<BpPosition>(m_inputPos.data() + lo, hi - lo);
+    }
+    // New node (>= m_inputGraphNodeCount): lazy-fetch from GRG.
+    populateMutationOverride(nodeId);
+    const std::vector<BpPosition>& vec = m_overridePos.at(nodeId);
+    return Span<BpPosition>(vec.data(), vec.size());
+}
+
+Span<MutationId> NonDuplicationRecombiner::getMutationIdsView(NodeID nodeId) {
+    auto it = m_overrideMutIds.find(nodeId);
+    if (it != m_overrideMutIds.end()) {
+        return Span<MutationId>(it->second.data(), it->second.size());
+    }
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        const size_t lo = m_inputMutOffsets[nodeId];
+        const size_t hi = m_inputMutOffsets[nodeId + 1];
+        return Span<MutationId>(m_inputMutIds.data() + lo, hi - lo);
+    }
+    // populateMutationOverride populates both maps; if mutIds was missing,
+    // positions was too -- safe to call from either getter.
+    populateMutationOverride(nodeId);
+    const std::vector<MutationId>& vec = m_overrideMutIds.at(nodeId);
+    return Span<MutationId>(vec.data(), vec.size());
+}
+
+Span<NodeID> NonDuplicationRecombiner::getUpEdgesView(NodeID nodeId) {
+    auto it = m_overrideUpEdges.find(nodeId);
+    if (it != m_overrideUpEdges.end()) {
+        return Span<NodeID>(it->second.data(), it->second.size());
+    }
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        const size_t lo = m_inputUpEdgesOffsets[nodeId];
+        const size_t hi = m_inputUpEdgesOffsets[nodeId + 1];
+        return Span<NodeID>(m_inputUpEdges.data() + lo, hi - lo);
+    }
+    populateUpEdgesOverride(nodeId);
+    const std::vector<NodeID>& vec = m_overrideUpEdges.at(nodeId);
+    return Span<NodeID>(vec.data(), vec.size());
 }
 
 // ------------------------------------------------------------------
@@ -281,10 +356,15 @@ IntervalOpt NonDuplicationRecombiner::getNodeAndAncestorSpan(NodeID nodeId) {
         return m_spanCache[nodeId];
     }
 
-    // Iterative post-order DFS — mirrors Python's two-phase stack. Each entry
+    // Iterative post-order DFS -- mirrors Python's two-phase stack. Each entry
     // is (nid, processed). processed=false means "push children, then re-push
     // self with processed=true"; processed=true means "all parents resolved,
     // compute and store own span_cache".
+    //
+    // Span lifetimes: positions / up-edges spans are acquired and consumed
+    // within a single (nid, processed=true) iteration. Pushing parents for
+    // recursion uses up-edges immediately, so no span outlives a potentially-
+    // mutating call.
     std::vector<std::pair<NodeID, bool>> stack;
     std::unordered_set<NodeID> scheduled;
     stack.emplace_back(nodeId, false);
@@ -300,13 +380,15 @@ IntervalOpt NonDuplicationRecombiner::getNodeAndAncestorSpan(NodeID nodeId) {
             BpPosition minP = NO_POS_SENTINEL;
             BpPosition maxP = 0;
             bool anySet = false;
-            const auto& muts = getNodeMutations(nid);
-            if (!muts.empty()) {
-                minP = muts.front().second;
-                maxP = muts.back().second;
+            Span<BpPosition> positions = getPositionsView(nid);
+            if (!positions.empty()) {
+                minP = positions.front();
+                maxP = positions.back();
                 anySet = true;
             }
-            for (NodeID parent : getUpEdgesCached(nid)) {
+            Span<NodeID> parents = getUpEdgesView(nid);
+            for (std::size_t i = 0; i < parents.size(); i++) {
+                const NodeID parent = parents[i];
                 const IntervalOpt& pSpan = m_spanCache[parent];
                 if (pSpan.isSet()) {
                     if (!anySet) {
@@ -327,7 +409,9 @@ IntervalOpt NonDuplicationRecombiner::getNodeAndAncestorSpan(NodeID nodeId) {
             scheduled.erase(nid);
         } else {
             stack.emplace_back(nid, true);
-            for (NodeID parent : getUpEdgesCached(nid)) {
+            Span<NodeID> parents = getUpEdgesView(nid);
+            for (std::size_t i = 0; i < parents.size(); i++) {
+                const NodeID parent = parents[i];
                 if (m_spanCache[parent].isUninit() && scheduled.find(parent) == scheduled.end()) {
                     stack.emplace_back(parent, false);
                     scheduled.insert(parent);
@@ -344,11 +428,15 @@ IntervalOpt NonDuplicationRecombiner::getAncestralCoverage(NodeID nodeId) {
         return m_ancCovCache[nodeId];
     }
 
-    const std::vector<NodeID>& parents = getUpEdgesCached(nodeId);
-    if (parents.empty()) {
+    // Take the parent NodeID list by value before calling getNodeAndAncestorSpan,
+    // which may lazy-fetch positions/up-edges for other nodes and rehash the
+    // override maps, invalidating any span we hold.
+    Span<NodeID> parentsView = getUpEdgesView(nodeId);
+    if (parentsView.empty()) {
         m_ancCovCache[nodeId] = IntervalOpt::makeEmpty();
         return m_ancCovCache[nodeId];
     }
+    std::vector<NodeID> parents(parentsView.begin(), parentsView.end());
 
     BpPosition minPos = NO_POS_SENTINEL;
     BpPosition maxPos = 0;
@@ -405,8 +493,12 @@ NonDuplicationRecombiner::extractBubble(NodeID nodeId, const std::vector<Mutatio
     m_audit.connectCallsInExtract += 2;
     m_audit.extractBubbleCalls += 1;
 
-    // node_id just gained a new up-edge; drop its cached up-edges list.
-    m_upEdgesCache.erase(nodeId);
+    // node_id just gained a new up-edge (bubbleId is now a parent of node_id).
+    // Eagerly refresh the override map so subsequent within-call traversals
+    // (recurseAttach pushing parents after bubble extraction) see the new
+    // bubble parent. For input nodes this shadows the CSR; for new nodes
+    // this overwrites the prior override.
+    populateUpEdgesOverride(nodeId);
 
     BubbleOp op;
     op.nodeId = nodeId;
@@ -512,11 +604,25 @@ void NonDuplicationRecombiner::clearModifiedCaches() {
         t = std::chrono::steady_clock::now();
     }
     for (NodeID nodeId : m_modifiedNodes) {
-        m_mutationCache.erase(nodeId);
-        m_posCache.erase(nodeId);
         if (static_cast<size_t>(nodeId) < m_spanCache.size()) {
             m_spanCache[nodeId] = IntervalOpt();   // back to Uninit
             m_ancCovCache[nodeId] = IntervalOpt(); // back to Uninit
+        }
+        if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+            // Input-graph node: the CSR slice is now stale (applyPendingBubbles
+            // moved some of node_id's mutations to the bubble). Eagerly refresh
+            // the override map so it shadows the CSR with current GRG state.
+            // m_overrideUpEdges was already refreshed eagerly by extractBubble
+            // and stays valid until the next bubble extraction touches this
+            // node.
+            populateMutationOverride(nodeId);
+        } else {
+            // Bubble / offspring node: clear overrides so the next access
+            // lazy-refetches from the GRG (which now reflects the post-
+            // applyPendingBubbles state).
+            m_overrideMutIds.erase(nodeId);
+            m_overridePos.erase(nodeId);
+            m_overrideUpEdges.erase(nodeId);
         }
     }
     m_modifiedNodes.clear();
@@ -670,6 +776,59 @@ SignedNodeID NonDuplicationRecombiner::recombineMulti(const std::vector<std::pai
     return registerOffspring(offspringId);
 }
 
+// Rebuild m_inputPos / m_inputMutIds / m_inputMutOffsets from the GRG's
+// current state. Called at endGeneration after sortMutations renumbers
+// MutationIds; positions are unchanged by sortMutations but a node's mutation
+// count may have shrunk (mutations relocated to bubbles by applyPendingBubbles).
+// Up-edges CSR is unaffected -- topology doesn't change in sortMutations.
+void NonDuplicationRecombiner::rebuildInputMutationCSR() {
+    const size_t n = m_inputGraphNodeCount;
+    if (n == 0) {
+        return;
+    }
+
+    // Pass 1: build per-node sorted mutation pairs into temporaries; count sizes.
+    std::vector<std::vector<MutationId>> mutIdsTmp(n);
+    std::vector<std::vector<BpPosition>> posTmp(n);
+    m_inputMutOffsets.assign(n + 1, 0);
+    for (NodeID node = 0; node < n; node++) {
+        std::vector<MutationId> rawMutIds = m_grg->getMutationsForNode<MutationId>(node, /*allowSort=*/false);
+        std::vector<std::pair<MutationId, BpPosition>> mutPairs;
+        mutPairs.reserve(rawMutIds.size());
+        for (MutationId mid : rawMutIds) {
+            const Mutation& mut = m_grg->getMutationById(mid);
+            mutPairs.emplace_back(mid, mut.getPosition());
+        }
+        if (mutPairs.size() > 1) {
+            std::sort(mutPairs.begin(),
+                      mutPairs.end(),
+                      [](const std::pair<MutationId, BpPosition>& a, const std::pair<MutationId, BpPosition>& b) {
+                          return a.second < b.second;
+                      });
+        }
+        mutIdsTmp[node].reserve(mutPairs.size());
+        posTmp[node].reserve(mutPairs.size());
+        for (const std::pair<MutationId, BpPosition>& mp : mutPairs) {
+            mutIdsTmp[node].push_back(mp.first);
+            posTmp[node].push_back(mp.second);
+        }
+        m_inputMutOffsets[node + 1] = m_inputMutOffsets[node] + mutPairs.size();
+    }
+
+    // Pass 2: flatten into CSR.
+    m_inputMutIds.assign(m_inputMutOffsets[n], 0);
+    m_inputPos.assign(m_inputMutOffsets[n], 0);
+    for (NodeID node = 0; node < n; node++) {
+        const size_t off = m_inputMutOffsets[node];
+        const std::vector<MutationId>& mids = mutIdsTmp[node];
+        const std::vector<BpPosition>& pos = posTmp[node];
+        for (size_t i = 0; i < mids.size(); i++) {
+            m_inputMutIds[off + i] = mids[i];
+            m_inputPos[off + i] = pos[i];
+        }
+    }
+}
+
 void NonDuplicationRecombiner::endGeneration() {
     std::chrono::steady_clock::time_point t;
     if (m_instrument) {
@@ -680,10 +839,15 @@ void NonDuplicationRecombiner::endGeneration() {
         m_stats.sortMutationsTime += elapsedSeconds(t);
     }
     // sortMutations renumbers MutationIds (by (position, allele)), so any
-    // cached (mut_id, position) pairs from this generation are now stale.
-    // Position-derived caches (span, anc_cov, up_edges) survive intentionally.
-    m_mutationCache.clear();
-    m_posCache.clear();
+    // cached MutationIds are stale. Rebuild the input CSR fully (cheap;
+    // O(V + E) once per generation). Clear all mutation overrides since
+    // they also reference stale MutationIds.
+    // m_overrideUpEdges survives -- up-edges are unaffected by sortMutations
+    // and the bubble-parent records accumulated across recombines remain
+    // valid.
+    rebuildInputMutationCSR();
+    m_overrideMutIds.clear();
+    m_overridePos.clear();
 }
 
 void NonDuplicationRecombiner::clearPendingSampleRemovals() { m_pendingSampleRemovals.clear(); }
@@ -738,15 +902,11 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
         m_visitedGen[nodeId] = genV;
         m_audit.visits++;
 
-        // Cache-hit fast path: mutation/pos cache populated by buildAncestralCaches
-        // for every input-graph node; lazy fallback handles bubbles/offspring.
-        auto posIt = m_posCache.find(nodeId);
-        if (posIt == m_posCache.end()) {
-            getNodeMutations(nodeId);
-            posIt = m_posCache.find(nodeId);
-        }
-        const std::vector<BpPosition>& positions = posIt->second;
-
+        // Positions span: CSR slice for input nodes, override-map view for new
+        // / modified ones (lazy-populated on first miss). Span lifetime: only
+        // used here for the two lower_bound calls; subsequent steps re-acquire
+        // spans as needed (getAncestralCoverage may mutate override maps).
+        Span<BpPosition> positions = getPositionsView(nodeId);
         size_t left = 0;
         size_t right = 0;
         if (!positions.empty()) {
@@ -780,12 +940,8 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
                     m_audit.directAttachDup++;
                 }
             } else if (hasPartialRelevant) {
-                const auto& mutsAtNode = m_mutationCache[nodeId];
-                std::vector<MutationId> relMutIds;
-                relMutIds.reserve(numRel);
-                for (size_t i = left; i < right; i++) {
-                    relMutIds.push_back(mutsAtNode[i].first);
-                }
+                Span<MutationId> mutIds = getMutationIdsView(nodeId);
+                std::vector<MutationId> relMutIds(mutIds.begin() + left, mutIds.begin() + right);
                 const NodeID bubbleId = extractBubble(nodeId, relMutIds, offspringId);
                 m_connectedGen[bubbleId] = genC;
                 m_audit.bubbleStripPartialRt++;
@@ -820,7 +976,7 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
         }
 
         if (hasNoRelevant) {
-            const std::vector<NodeID>& parents = getUpEdgesCached(nodeId);
+            Span<NodeID> parents = getUpEdgesView(nodeId);
             // Early-attach optimization: multi-parent empty intermediary
             // fully covering [L, R) attaches directly instead of walking up.
             // Gated on num_all==0 + full_coverage + fanout>1; see Python
@@ -852,8 +1008,8 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
             // Skip parents already attached to this offspring (typically
             // bubbles from earlier segments). Iterate in reverse so the
             // first parent is processed first off the stack.
-            for (auto it = parents.rbegin(); it != parents.rend(); ++it) {
-                const NodeID parent = *it;
+            for (std::size_t i = parents.size(); i-- > 0;) {
+                const NodeID parent = parents[i];
                 if (m_connectedGen[parent] != genC) {
                     stack.push_back({parent, newL, newR});
                 }
@@ -862,14 +1018,12 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
         }
 
         // Partial / all relevant, not full coverage -> bubble + maybe recurse.
-        const auto& mutsAtNode = m_mutationCache[nodeId];
-        std::vector<MutationId> relMutIds;
-        relMutIds.reserve(numRel);
-        for (size_t i = left; i < right; i++) {
-            relMutIds.push_back(mutsAtNode[i].first);
+        {
+            Span<MutationId> mutIds = getMutationIdsView(nodeId);
+            std::vector<MutationId> relMutIds(mutIds.begin() + left, mutIds.begin() + right);
+            const NodeID bubbleId = extractBubble(nodeId, relMutIds, offspringId);
+            m_connectedGen[bubbleId] = genC;
         }
-        const NodeID bubbleId = extractBubble(nodeId, relMutIds, offspringId);
-        m_connectedGen[bubbleId] = genC;
 
         // Classify exactly one of the 5 non-root bubble cells.
         if (hasAllRelevant) {
@@ -896,10 +1050,12 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
                 m_audit.skipEmptyTrim++;
                 continue;
             }
-            // extractBubble invalidated m_upEdgesCache[nodeId]; re-fetch.
-            const std::vector<NodeID>& parents = getUpEdgesCached(nodeId);
-            for (auto it = parents.rbegin(); it != parents.rend(); ++it) {
-                const NodeID parent = *it;
+            // extractBubble refreshed m_overrideUpEdges[nodeId]; re-fetch the
+            // up-edges view to see the new bubble parent (skipped below via
+            // the connectedGen guard since extractBubble's caller marked it).
+            Span<NodeID> parents = getUpEdgesView(nodeId);
+            for (std::size_t i = parents.size(); i-- > 0;) {
+                const NodeID parent = parents[i];
                 if (m_connectedGen[parent] != genC) {
                     stack.push_back({parent, newL, newR});
                 }
