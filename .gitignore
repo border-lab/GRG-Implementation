@@ -24,6 +24,7 @@ benchmark/*.png
 benchmark/*.jpg
 benchmark/figures
 benchmark/generate_scaling_figures.py
+benchmark/generate_parity_figures.py
 
 # Ignore testing scripts
 benchmark/*.sh
