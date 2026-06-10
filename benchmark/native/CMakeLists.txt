@@ -9,10 +9,23 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Point at the grgl source tree. Default assumes the standard repo layout
-# (../../grgl from benchmark/native/); override with -DGRGL_ROOT=... if needed.
+# Point at the grgl source tree. Tries common relative layouts in order:
+#   ../../grgl   -- repo layout (benchmark/native/ inside a tree that has grgl/ at the root)
+#   ../grgl      -- flatter layout (native/ sits as a sibling of grgl/)
+# Override with -DGRGL_ROOT=/abs/path or the GRGL_ROOT env var if neither matches.
 if(NOT DEFINED GRGL_ROOT)
-    set(GRGL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../grgl")
+    foreach(_candidate "../../grgl" "../grgl")
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_candidate}/CMakeLists.txt")
+            set(GRGL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/${_candidate}")
+            break()
+        endif()
+    endforeach()
+endif()
+if(NOT DEFINED GRGL_ROOT)
+    message(FATAL_ERROR
+        "Could not auto-detect a grgl source tree. Tried ../../grgl and ../grgl "
+        "relative to ${CMAKE_CURRENT_SOURCE_DIR}. Pass -DGRGL_ROOT=/abs/path or set "
+        "the GRGL_ROOT environment variable.")
 endif()
 get_filename_component(GRGL_ROOT "${GRGL_ROOT}" ABSOLUTE)
 if(NOT EXISTS "${GRGL_ROOT}/CMakeLists.txt")
