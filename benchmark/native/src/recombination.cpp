@@ -653,7 +653,6 @@ SignedNodeID NonDuplicationRecombiner::recombine(NodeID hapA, NodeID hapB, BpPos
     m_pendingBubbles.clear();
 
     std::chrono::steady_clock::time_point t;
-    const uint64_t genVBefore = m_genVisited;
     if (m_instrument) {
         t = std::chrono::steady_clock::now();
     }
@@ -695,14 +694,6 @@ SignedNodeID NonDuplicationRecombiner::recombine(NodeID hapA, NodeID hapB, BpPos
     clearModifiedCaches();
 
     if (m_instrument) {
-        const uint64_t genVAfter = m_genVisited;
-        uint64_t v = 0;
-        for (uint64_t gen : m_visitedGen) {
-            if (gen > genVBefore && gen <= genVAfter) {
-                v++;
-            }
-        }
-        m_stats.visitsTotal += v;
         m_stats.offspringCount += 1;
     }
 
@@ -714,7 +705,6 @@ SignedNodeID NonDuplicationRecombiner::recombineMulti(const std::vector<std::pai
     m_pendingBubbles.clear();
 
     std::chrono::steady_clock::time_point t;
-    const uint64_t genVBefore = m_genVisited;
     if (m_instrument) {
         t = std::chrono::steady_clock::now();
     }
@@ -762,14 +752,6 @@ SignedNodeID NonDuplicationRecombiner::recombineMulti(const std::vector<std::pai
     clearModifiedCaches();
 
     if (m_instrument) {
-        const uint64_t genVAfter = m_genVisited;
-        uint64_t v = 0;
-        for (uint64_t gen : m_visitedGen) {
-            if (gen > genVBefore && gen <= genVAfter) {
-                v++;
-            }
-        }
-        m_stats.visitsTotal += v;
         m_stats.offspringCount += 1;
     }
 
@@ -901,6 +883,9 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
         }
         m_visitedGen[nodeId] = genV;
         m_audit.visits++;
+        if (m_instrument) {
+            m_stats.visitsTotal++;
+        }
 
         // Positions span: CSR slice for input nodes, override-map view for new
         // / modified ones (lazy-populated on first miss). Span lifetime: only

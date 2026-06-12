@@ -5,6 +5,7 @@ grg_files
 
 # Ignore benchmark output
 benchmark/output
+benchmark/sc_results
 
 # Ignore benchmark environment
 benchmark/.venv
