@@ -54,6 +54,7 @@ NonDuplicationRecombiner::NonDuplicationRecombiner(MutableGRGPtr grg, bool instr
     m_ancCovCache.resize(n); // default-constructed -> Uninit
     m_visitedGen.resize(n, 0);
     m_connectedGen.resize(n, 0);
+    m_dirty.resize(n, 0);
 
     buildAncestralCaches();
 }
@@ -292,55 +293,70 @@ void NonDuplicationRecombiner::populateMutationOverride(NodeID nodeId) {
     }
     m_overrideMutIds[nodeId] = std::move(mids);
     m_overridePos[nodeId] = std::move(positions);
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        m_dirty[nodeId] |= DIRTY_MUT;
+    }
 }
 
 void NonDuplicationRecombiner::populateUpEdgesOverride(NodeID nodeId) {
     NodeIDList parents = m_grg->getUpEdges(nodeId);
     m_overrideUpEdges[nodeId] = std::vector<NodeID>(parents.begin(), parents.end());
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        m_dirty[nodeId] |= DIRTY_UP;
+    }
 }
 
 Span<BpPosition> NonDuplicationRecombiner::getPositionsView(NodeID nodeId) {
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        if (!(m_dirty[nodeId] & DIRTY_MUT)) {
+            const size_t lo = m_inputMutOffsets[nodeId];
+            const size_t hi = m_inputMutOffsets[nodeId + 1];
+            return Span<BpPosition>(m_inputPos.data() + lo, hi - lo);
+        }
+        const std::vector<BpPosition>& vec = m_overridePos.at(nodeId);
+        return Span<BpPosition>(vec.data(), vec.size());
+    }
     auto it = m_overridePos.find(nodeId);
     if (it != m_overridePos.end()) {
         return Span<BpPosition>(it->second.data(), it->second.size());
     }
-    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
-        const size_t lo = m_inputMutOffsets[nodeId];
-        const size_t hi = m_inputMutOffsets[nodeId + 1];
-        return Span<BpPosition>(m_inputPos.data() + lo, hi - lo);
-    }
-    // New node (>= m_inputGraphNodeCount): lazy-fetch from GRG.
     populateMutationOverride(nodeId);
     const std::vector<BpPosition>& vec = m_overridePos.at(nodeId);
     return Span<BpPosition>(vec.data(), vec.size());
 }
 
 Span<MutationId> NonDuplicationRecombiner::getMutationIdsView(NodeID nodeId) {
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        if (!(m_dirty[nodeId] & DIRTY_MUT)) {
+            const size_t lo = m_inputMutOffsets[nodeId];
+            const size_t hi = m_inputMutOffsets[nodeId + 1];
+            return Span<MutationId>(m_inputMutIds.data() + lo, hi - lo);
+        }
+        const std::vector<MutationId>& vec = m_overrideMutIds.at(nodeId);
+        return Span<MutationId>(vec.data(), vec.size());
+    }
     auto it = m_overrideMutIds.find(nodeId);
     if (it != m_overrideMutIds.end()) {
         return Span<MutationId>(it->second.data(), it->second.size());
     }
-    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
-        const size_t lo = m_inputMutOffsets[nodeId];
-        const size_t hi = m_inputMutOffsets[nodeId + 1];
-        return Span<MutationId>(m_inputMutIds.data() + lo, hi - lo);
-    }
-    // populateMutationOverride populates both maps; if mutIds was missing,
-    // positions was too -- safe to call from either getter.
     populateMutationOverride(nodeId);
     const std::vector<MutationId>& vec = m_overrideMutIds.at(nodeId);
     return Span<MutationId>(vec.data(), vec.size());
 }
 
 Span<NodeID> NonDuplicationRecombiner::getUpEdgesView(NodeID nodeId) {
+    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
+        if (!(m_dirty[nodeId] & DIRTY_UP)) {
+            const size_t lo = m_inputUpEdgesOffsets[nodeId];
+            const size_t hi = m_inputUpEdgesOffsets[nodeId + 1];
+            return Span<NodeID>(m_inputUpEdges.data() + lo, hi - lo);
+        }
+        const std::vector<NodeID>& vec = m_overrideUpEdges.at(nodeId);
+        return Span<NodeID>(vec.data(), vec.size());
+    }
     auto it = m_overrideUpEdges.find(nodeId);
     if (it != m_overrideUpEdges.end()) {
         return Span<NodeID>(it->second.data(), it->second.size());
-    }
-    if (static_cast<size_t>(nodeId) < m_inputGraphNodeCount) {
-        const size_t lo = m_inputUpEdgesOffsets[nodeId];
-        const size_t hi = m_inputUpEdgesOffsets[nodeId + 1];
-        return Span<NodeID>(m_inputUpEdges.data() + lo, hi - lo);
     }
     populateUpEdgesOverride(nodeId);
     const std::vector<NodeID>& vec = m_overrideUpEdges.at(nodeId);
@@ -828,6 +844,11 @@ void NonDuplicationRecombiner::endGeneration() {
     // and the bubble-parent records accumulated across recombines remain
     // valid.
     rebuildInputMutationCSR();
+    for (const auto& entry : m_overrideMutIds) {
+        if (static_cast<size_t>(entry.first) < m_inputGraphNodeCount) {
+            m_dirty[entry.first] &= ~DIRTY_MUT;
+        }
+    }
     m_overrideMutIds.clear();
     m_overridePos.clear();
 }

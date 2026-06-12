@@ -168,9 +168,10 @@ struct AuditCounters {
  * `stats` dict in NonDuplicationRecombination._fresh_stats() (camelCase here,
  * snake_case in the dict serialization for parity with the Python interface).
  *
- * Overhead when instrumentation is on: ~20-40 ns per std::chrono::steady_clock
- * probe (vs ~150 ns/probe for Python's time.perf_counter). With ~10 probes per
- * moved mutation, this is well under 1% of total runtime even at biobank scale.
+ * Overhead: chrono probes within instrumented phases add <2% to their
+ * wallclock (~40-100 ns per steady_clock::now() on Linux x86_64, with ~10
+ * probes per moved mutation in applyPendingBubbles). visitsTotal is counted
+ * incrementally at the visit site in recurseAttach (O(1) per visit).
  */
 struct RecombinerStats {
     // Phase wallclock (seconds)
@@ -475,6 +476,16 @@ private:
     std::unordered_map<NodeID, std::vector<MutationId>> m_overrideMutIds;
     std::unordered_map<NodeID, std::vector<BpPosition>> m_overridePos;
     std::unordered_map<NodeID, std::vector<NodeID>> m_overrideUpEdges;
+
+    // --- Dirty flags for input-graph nodes ---
+    // Per-node bitmask indicating which override maps shadow the CSR for this
+    // input node. When a bit is clear the accessor skips the hash probe and
+    // reads straight from the CSR. Indexed by NodeID; only meaningful for
+    // NodeID < m_inputGraphNodeCount (bubble/offspring nodes always probe the
+    // override map). Bit layout: 0x01 = mut/pos, 0x02 = up-edges.
+    static const uint8_t DIRTY_MUT  = 0x01;
+    static const uint8_t DIRTY_UP   = 0x02;
+    std::vector<uint8_t> m_dirty;
 
     // Deferred work.
     std::vector<BubbleOp> m_pendingBubbles;
