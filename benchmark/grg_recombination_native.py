@@ -76,6 +76,7 @@ _STATS_KEYS = (
     "visits_total",
     "bubbles_created",
     "mutations_moved",
+    "pre_pruned_skips",
 )
 
 
@@ -138,6 +139,17 @@ class NonDuplicationRecombination:
     @defer_sample_updates.setter
     def defer_sample_updates(self, value):
         self._native.defer_sample_updates = value
+
+    # Push-site pre-prune toggle. Default ON in the C++ ctor. Flip OFF when
+    # running parity checks against the Python reference (which does not
+    # pre-prune, so audit `visits` / `pruning` would diverge).
+    @property
+    def pre_prune_enabled(self):
+        return self._native.pre_prune_enabled
+
+    @pre_prune_enabled.setter
+    def pre_prune_enabled(self, value):
+        self._native.pre_prune_enabled = value
 
     # debug_mode is a class attribute (legacy); forward only when set on the
     # instance.

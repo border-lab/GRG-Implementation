@@ -72,6 +72,7 @@ py::dict toStatsDict(const grgl::RecombinerStats& s) {
     d["visits_total"] = s.visitsTotal;
     d["bubbles_created"] = s.bubblesCreated;
     d["mutations_moved"] = s.mutationsMoved;
+    d["pre_pruned_skips"] = s.prePrunedSkips;
     return d;
 }
 
@@ -123,6 +124,14 @@ PYBIND11_MODULE(_grg_recomb_native, m) {
         .def_property("defer_sample_updates",
                       &grgl::NonDuplicationRecombiner::getDeferSampleUpdates,
                       &grgl::NonDuplicationRecombiner::setDeferSampleUpdates)
+        .def_property("pre_prune_enabled",
+                      &grgl::NonDuplicationRecombiner::getPrePruneEnabled,
+                      &grgl::NonDuplicationRecombiner::setPrePruneEnabled,
+                      "Push-site pre-prune optimization toggle (default: True). Disable\n"
+                      "for byte-for-byte audit-dict parity with the Python reference;\n"
+                      "the Python implementation does not pre-prune, so the C++ `visits`\n"
+                      "and `pruning` counts diverge when this is on. See\n"
+                      "setPrePruneEnabled() docs on the C++ class for details.")
         .def_property(
             "debug_mode", &grgl::NonDuplicationRecombiner::getDebugMode, &grgl::NonDuplicationRecombiner::setDebugMode)
         .def_property_readonly("instrument", &grgl::NonDuplicationRecombiner::isInstrumented)

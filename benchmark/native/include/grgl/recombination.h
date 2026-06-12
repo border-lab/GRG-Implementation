@@ -201,6 +201,12 @@ struct RecombinerStats {
     uint64_t visitsTotal;
     uint64_t bubblesCreated;
     uint64_t mutationsMoved;
+    // Push-site pre-prune skips: parents that would have hit the `pruning` case
+    // were detected from the parent and never pushed onto the DFS stack. Drops
+    // the equivalent count from `visits` / `pruning` on the audit dict (the
+    // skipped node was never visited), so audit-dict byte-parity with the
+    // Python reference does not hold when pre-prune is enabled.
+    uint64_t prePrunedSkips;
 
     RecombinerStats()
         : initCachesTime(0.0),
@@ -225,7 +231,8 @@ struct RecombinerStats {
           segmentsProcessed(0),
           visitsTotal(0),
           bubblesCreated(0),
-          mutationsMoved(0) {}
+          mutationsMoved(0),
+          prePrunedSkips(0) {}
 };
 
 /**
@@ -237,28 +244,40 @@ struct RecombinerStats {
  * binding).
  *
  * Cache layout: per-node mutation, position, and up-edge data are stored in
- * a hybrid CSR + override structure. Input-graph nodes (NodeID <
- * m_inputGraphNodeCount) live in three pairs of flat CSR arrays
- * (m_inputPos / m_inputMutIds / m_inputMutOffsets and m_inputUpEdges /
- * m_inputUpEdgesOffsets). Bubble + offspring nodes -- and any input node
- * whose up-edges were modified by extractBubble or whose mutations were
- * relocated by applyPendingBubbles -- live in three override hash maps that
- * shadow the CSR. Lookups consult the override first, then the CSR, then
- * lazy-fetch from the GRG. See "Cache flattening to SoA" in DESIGN.md for
- * the motivation (per-visit cost reduction at biobank scale).
+ * a hybrid CSR + override structure with a per-input-node dirty-flag fast
+ * path. Input-graph nodes (NodeID < m_inputGraphNodeCount) live in three
+ * pairs of flat CSR arrays (m_inputPos / m_inputMutIds / m_inputMutOffsets
+ * and m_inputUpEdges / m_inputUpEdgesOffsets). Bubble + offspring nodes --
+ * and any input node whose up-edges were modified by extractBubble or whose
+ * mutations were relocated by applyPendingBubbles -- live in three override
+ * hash maps that shadow the CSR. Lookups check the per-node m_dirty bitmask
+ * (DIRTY_MUT=0x01, DIRTY_UP=0x02) first: when clear for the relevant slot,
+ * the accessor reads the CSR directly with zero hash work. Only dirty input
+ * nodes and bubble/offspring nodes consult the override map. See "Cache
+ * flattening to SoA" and "Dirty-bit guard" in DESIGN.md.
+ *
+ * Push-site pre-prune (m_prePruneEnabled, default true): before pushing a
+ * parent onto the DFS stack in recurseAttach, check whether it would land in
+ * the `pruning` audit case (zero mutations + ancestral coverage disjoint
+ * from the push interval). Such parents are skipped entirely -- no visit,
+ * no `visits++`. The check is conservative; any uncertainty (mutation
+ * override dirty, Uninit/Empty ancCov, bubble/offspring node) falls through
+ * to a normal push + visit. Disable via setPrePruneEnabled(false) for
+ * byte-for-byte audit-dict parity with the Python reference (which does not
+ * pre-prune). See "Push-site pre-prune" in DESIGN.md.
  *
  * Cache invalidation rules (see recombination.cpp for the full discussion):
  *   - extractBubble() invalidates node_id (lost mutations) and bubble_id (new
  *     slot); it does NOT invalidate node_id's parents, since their span /
  *     anc_cov depend only on themselves and their own ancestors -- neither of
  *     which changes when a bubble is extracted.
- *   - extractBubble() eagerly refreshes m_overrideUpEdges[node_id] so the
- *     newly-added bubble parent is visible to subsequent within-call
- *     traversals (shadows the CSR for that node).
+ *   - extractBubble() eagerly refreshes m_overrideUpEdges[node_id] (sets
+ *     DIRTY_UP) so the newly-added bubble parent is visible to subsequent
+ *     within-call traversals.
  *   - endGeneration() calls sortMutations() and then fully rebuilds the
- *     input-graph mutation CSR (sortMutations renumbers MutationIds). The
- *     up-edges CSR survives because positions and edge topology don't change
- *     during sortMutations; m_overrideMutIds/m_overridePos are cleared.
+ *     input-graph mutation CSR (sortMutations renumbers MutationIds), clears
+ *     m_overrideMutIds / m_overridePos, and clears DIRTY_MUT for every input
+ *     node. The up-edges CSR and DIRTY_UP flags survive across generations.
  *
  * Offspring node-ID convention: negative IDs allocated by calling
  * grg->makeNode() with count=1 and negative=true. The reverse-lookup table
@@ -340,6 +359,22 @@ public:
     bool getDebugMode() const { return m_debug; }
 
     bool isInstrumented() const { return m_instrument; }
+
+    /**
+     * Enable/disable the push-site pre-prune optimization (default: on).
+     *
+     * When enabled, before pushing a parent onto the DFS stack we check
+     * whether the parent would land in the `pruning` audit case — i.e. it
+     * has zero mutations and its ancestral coverage is disjoint from the
+     * push interval [newL, newR). Such parents are skipped entirely
+     * (no visit, no `visits++`, no `pruning++`).
+     *
+     * Disable for byte-for-byte audit-dict parity with the Python
+     * reference (the Python implementation does not pre-prune, so `visits`
+     * and `pruning` counts diverge when this is on).
+     */
+    void setPrePruneEnabled(bool enabled) { m_prePruneEnabled = enabled; }
+    bool getPrePruneEnabled() const { return m_prePruneEnabled; }
 
     const AuditCounters& getAudit() const { return m_audit; }
     void resetAudit() { m_audit = AuditCounters(); }
@@ -497,6 +532,9 @@ private:
     bool m_instrument;
     bool m_debug;
     bool m_deferSampleUpdates;
+    // Push-site pre-prune toggle; see setPrePruneEnabled() docs. Defaults to
+    // true (optimization on). Initialized in the .cpp constructor.
+    bool m_prePruneEnabled;
 
     // Offspring tracking (mirror of Python NEGATIVE_NODE_IDS +
     // _negative_node_index).

@@ -42,7 +42,8 @@ NonDuplicationRecombiner::NonDuplicationRecombiner(MutableGRGPtr grg, bool instr
       m_stats(),
       m_instrument(instrument),
       m_debug(false),
-      m_deferSampleUpdates(false) {
+      m_deferSampleUpdates(false),
+      m_prePruneEnabled(true) {
     if (!m_grg) {
         throw std::invalid_argument("NonDuplicationRecombiner: null MutableGRGPtr");
     }
@@ -1014,9 +1015,29 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
             // Skip parents already attached to this offspring (typically
             // bubbles from earlier segments). Iterate in reverse so the
             // first parent is processed first off the stack.
+            //
+            // Pre-prune (gated on m_prePruneEnabled): if the parent is an
+            // input-graph node with zero mutations (CSR slice empty AND
+            // mut-override clean) AND its ancCov is disjoint from
+            // [newL, newR), the visit would hit `pruning` and do nothing
+            // useful. Skip the push entirely. The check is conservative —
+            // any uncertainty (dirty bit, Uninit/Empty ancCov, bubble or
+            // offspring node) falls through to normal visit.
             for (std::size_t i = parents.size(); i-- > 0;) {
                 const NodeID parent = parents[i];
                 if (m_connectedGen[parent] != genC) {
+                    if (m_prePruneEnabled
+                        && static_cast<size_t>(parent) < m_inputGraphNodeCount
+                        && !(m_dirty[parent] & DIRTY_MUT)
+                        && m_inputMutOffsets[parent] == m_inputMutOffsets[parent + 1]) {
+                        const IntervalOpt& cov = m_ancCovCache[parent];
+                        if (cov.isSet() && (newR <= cov.lo || newL >= cov.hi)) {
+                            if (m_instrument) {
+                                m_stats.prePrunedSkips++;
+                            }
+                            continue;
+                        }
+                    }
                     stack.push_back({parent, newL, newR});
                 }
             }
@@ -1059,10 +1080,24 @@ void NonDuplicationRecombiner::recurseAttach(NodeID rootId,
             // extractBubble refreshed m_overrideUpEdges[nodeId]; re-fetch the
             // up-edges view to see the new bubble parent (skipped below via
             // the connectedGen guard since extractBubble's caller marked it).
+            // Pre-prune mirrors the path-compression / decomposition branch;
+            // see comment there for the correctness argument.
             Span<NodeID> parents = getUpEdgesView(nodeId);
             for (std::size_t i = parents.size(); i-- > 0;) {
                 const NodeID parent = parents[i];
                 if (m_connectedGen[parent] != genC) {
+                    if (m_prePruneEnabled
+                        && static_cast<size_t>(parent) < m_inputGraphNodeCount
+                        && !(m_dirty[parent] & DIRTY_MUT)
+                        && m_inputMutOffsets[parent] == m_inputMutOffsets[parent + 1]) {
+                        const IntervalOpt& cov = m_ancCovCache[parent];
+                        if (cov.isSet() && (newR <= cov.lo || newL >= cov.hi)) {
+                            if (m_instrument) {
+                                m_stats.prePrunedSkips++;
+                            }
+                            continue;
+                        }
+                    }
                     stack.push_back({parent, newL, newR});
                 }
             }

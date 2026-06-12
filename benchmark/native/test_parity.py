@@ -96,6 +96,12 @@ def run_single_pass(grg_path, base_seed, num_generations, num_offspring_per_coup
     # --- C++ implementation ---
     g_cpp = pygrgl.load_mutable_grg(grg_path)
     cpp_recomb = CppImpl(g_cpp, instrument=True)
+    # Disable the push-site pre-prune so the C++ visits the same nodes as the
+    # Python reference; otherwise the audit `visits`, `pruning`, and
+    # `skip_already_visited` counters diverge (correctly -- pre-prune skips
+    # visits Python would still pay for). The perf benefit of pre-prune is
+    # measured separately via `benchmark_recombination.py --diagnostics`.
+    cpp_recomb.pre_prune_enabled = False
     cpp_offspring_per_gen = []
     cpp_total_t = 0.0
     for gen in range(num_generations):

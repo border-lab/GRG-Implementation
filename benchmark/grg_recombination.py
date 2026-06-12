@@ -233,6 +233,10 @@ class NonDuplicationRecombination:
             "visits_total": 0,
             "bubbles_created": 0,
             "mutations_moved": 0,
+            # Push-site pre-prune skips (C++ optimization only; always 0 in the
+            # Python reference). Tracked here so the dict key set matches the
+            # C++ backend for `test_parity.py`'s stats-key check.
+            "pre_pruned_skips": 0,
         }
 
     def reset_stats(self):
