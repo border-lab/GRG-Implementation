@@ -14,7 +14,7 @@ benchmark/.venv
 # Ignore local grgl package and testing
 benchmark/grgl
 benchmark/_debug_serialize_crash.py
-grgl
+/grgl
 
 # Ignore benchmark zip
 benchmark/recombination_benchmark.zip
