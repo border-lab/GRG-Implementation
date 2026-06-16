@@ -3,6 +3,10 @@ benchmark/test_grg_files
 benchmark/test_small
 grg_files
 
+# Ignore pycache
+__pycache__/
+benchmark/__pycache__/
+
 # Ignore benchmark output
 benchmark/output
 benchmark/sc_results
