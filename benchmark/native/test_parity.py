@@ -37,8 +37,17 @@ import numpy as np
 import pygrgl
 
 
-# Make sure we can import from benchmark/ regardless of cwd.
-BENCHMARK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# Resolve __file__ to a canonical absolute path BEFORE any cwd-relative
+# manipulation. Without realpath(), `__file__` can be a bare basename (when
+# invoked as `python test_parity.py` from inside native/) or a path through a
+# symlink (common on cluster scratch/home mounts). Both forms make the
+# subsequent abspath(join(..., "..")) cwd-dependent, which is the exact failure
+# mode the parity script must avoid -- it has to import the benchmark/ source
+# tree, not whatever happens to be one level up from cwd.
+_THIS_FILE = os.path.realpath(__file__)
+NATIVE_DIR = os.path.dirname(_THIS_FILE)
+BENCHMARK_DIR = os.path.dirname(NATIVE_DIR)
+REPO_ROOT = os.path.dirname(BENCHMARK_DIR)
 sys.path.insert(0, BENCHMARK_DIR)
 
 # Default parity-test output directory. Mirrors benchmark_recombination.py's
@@ -51,6 +60,19 @@ from grg_recombination import (
     simulate_grg_recombination,
 )
 from grg_recombination_native import NonDuplicationRecombination as CppImpl
+
+# Fail loud if the C++ extension didn't actually back CppImpl. The wrapper in
+# grg_recombination_native.py would already ImportError if the .so were
+# missing, but this guards against a future Python-only fallback being added
+# and silently making the "parity test" compare Python-to-Python.
+from grg_recomb_native import _grg_recomb_native as _native_so
+import grg_recombination_native as _native_wrapper
+import grg_recombination as _py_module
+assert CppImpl is not PyImpl, "CppImpl resolved to the Python class; native import path is broken"
+assert _native_wrapper._NativeRecombiner.__module__.endswith("_grg_recomb_native"), (
+    "grg_recombination_native is not bound to the C++ extension; "
+    f"got {_native_wrapper._NativeRecombiner.__module__}"
+)
 
 
 class _FakeBenchmark:
@@ -308,11 +330,25 @@ def main():
         print("--runs must be >= 1")
         sys.exit(2)
 
+    # Diagnostic banner: prints where each module was actually loaded from.
+    # Run from inside vs outside benchmark/native/ should produce identical
+    # paths here -- if they differ, the cluster is picking up a stale module.
+    print("=" * 70)
+    print(f"test_parity.py     : {_THIS_FILE}")
+    print(f"  BENCHMARK_DIR    : {BENCHMARK_DIR}")
+    print(f"  REPO_ROOT        : {REPO_ROOT}")
+    print(f"  cwd              : {os.getcwd()}")
+    print(f"  python           : {sys.executable}")
+    print(f"  pygrgl           : {pygrgl.__file__}")
+    print(f"  grg_recombination: {_py_module.__file__}")
+    print(f"  ...native wrapper: {_native_wrapper.__file__}")
+    print(f"  ...C++ extension : {_native_so.__file__}")
+    print("=" * 70)
+
     if args.grg is None:
-        repo_root = os.path.abspath(os.path.join(BENCHMARK_DIR, ".."))
         defaults = [
-            os.path.join(repo_root, "grg_files", "50inds_1k_snps.grg"),
-            os.path.join(repo_root, "grg_files", "500inds_10k_snps.grg"),
+            os.path.join(REPO_ROOT, "grg_files", "50inds_1k_snps.grg"),
+            os.path.join(REPO_ROOT, "grg_files", "500inds_10k_snps.grg"),
         ]
         args.grg = [p for p in defaults if os.path.exists(p)]
         if not args.grg:
