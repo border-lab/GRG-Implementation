@@ -590,6 +590,8 @@ class NonDuplicationRecombination:
         grg_connect = self.grg.connect
         pending_sample_removals_add = self._pending_sample_removals.add
         audit = self.audit  # hoisted for inner-loop speed
+        instrument = self.instrument
+        stats = self.stats
 
         audit['recurse_attach_calls'] += 1
 
@@ -609,6 +611,8 @@ class NonDuplicationRecombination:
                 continue
             visited_gen[node_id] = gen_v
             audit['visits'] += 1
+            if instrument:
+                stats['visits_total'] += 1
 
             # Inlined _get_mutation_range + _get_node_mutations cache-hit path.
             positions = pos_cache.get(node_id)
@@ -860,7 +864,6 @@ class NonDuplicationRecombination:
 
         if instrument:
             t = time.perf_counter()
-            gen_v_before = self._gen_visited
         self._sync_to_grg()
         if instrument:
             self.stats["sync_to_grg_time"] += time.perf_counter() - t
@@ -893,10 +896,6 @@ class NonDuplicationRecombination:
         self._clear_modified_caches()
 
         if instrument:
-            gen_v_after = self._gen_visited
-            gen_set = set(range(gen_v_before + 1, gen_v_after + 1))
-            v = sum(1 for x in self._visited_gen if x in gen_set)
-            self.stats["visits_total"] += v
             self.stats["offspring_count"] += 1
 
         return self._register_offspring(offspring_id)
@@ -908,7 +907,6 @@ class NonDuplicationRecombination:
 
         if instrument:
             t = time.perf_counter()
-            gen_v_before = self._gen_visited
         self._sync_to_grg()
         if instrument:
             self.stats["sync_to_grg_time"] += time.perf_counter() - t
@@ -943,10 +941,6 @@ class NonDuplicationRecombination:
         self._clear_modified_caches()
 
         if instrument:
-            gen_v_after = self._gen_visited
-            gen_set = set(range(gen_v_before + 1, gen_v_after + 1))
-            v = sum(1 for x in self._visited_gen if x in gen_set)
-            self.stats["visits_total"] += v
             self.stats["offspring_count"] += 1
 
         return self._register_offspring(offspring_id)
