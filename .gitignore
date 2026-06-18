@@ -25,6 +25,9 @@ benchmark/*.jpg
 benchmark/figures
 benchmark/generate_scaling_figures.py
 
+# Ignore supercomputer results
+benchmark/sc_results
+
 # Ignore testing scripts
 benchmark/*.sh
 benchmark/*.slurm
