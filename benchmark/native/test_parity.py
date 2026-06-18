@@ -8,21 +8,35 @@ with a fixed PRNG seed on each backend. Repeats the whole pass --warmup +
 contribute to timings, timed passes do; every pass independently parity-checks
 the two backends.
 
-Per-pass checks:
+Two modes, selected by --timing-mode:
+
+PARITY mode (default) -- per-pass checks:
   1. Returned offspring NodeID lists per generation are identical.
   2. Final audit dicts match key-for-key, value-for-value.
   3. Post-recombination GRG state matches (num_nodes, num_edges).
   4. Both backends' audit_check identities pass.
+  5. Stats dict key sets match.
+  Both backends constructed with instrument=True; C++ pre-prune disabled so
+  audit counts stay byte-identical to the Python reference. Wallclock numbers
+  include the instrumentation overhead on both sides and are NOT representative
+  of production timing. Output: `parity_results_<basename>.json`.
 
-Aggregate timing reporting:
-  - Mean and stdev of total wallclock per pass, both backends, plus speedup ratio.
-  - Mirrors benchmark_recombination.py's "mean_time_ms ± std" headline.
+TIMING mode (--timing-mode) -- per-pass checks:
+  1. Returned offspring NodeID lists per generation are identical.
+  3. Post-recombination GRG state matches (num_nodes, num_edges).
+  Both backends constructed with instrument=False; C++ pre-prune left at its
+  production default (True). Wallclock numbers are the production-relevant
+  measurement -- no chrono probes, no stats increments, pre-prune active.
+  Audit/stats comparisons are skipped (pre-prune diverges audit counters by
+  design; instrument=False zeros the C++ stats dict). Output:
+  `timing_results_<basename>.json`.
 
 Usage:
     cd benchmark/native
     ../../.venv/bin/python test_parity.py
     ../../.venv/bin/python test_parity.py --warmup 1 --runs 3
     ../../.venv/bin/python test_parity.py --grg ../../grg_files/16000inds_1m_snps.grg --runs 1
+    ../../.venv/bin/python test_parity.py --timing-mode --warmup 1 --runs 3
 """
 
 import argparse
@@ -93,19 +107,32 @@ class _FakeBenchmark:
         return bps, num_bp
 
 
-def run_single_pass(grg_path, base_seed, num_generations, num_offspring_per_couple):
+def run_single_pass(grg_path, base_seed, num_generations, num_offspring_per_couple,
+                    timing_mode=False):
     """One full pass: load fresh GRGs, construct both backends, run all generations.
 
     Same `base_seed` is used on both backends so breakpoint sampling and parent
     shuffling are identical across implementations. Caller varies `base_seed`
     across passes so workloads differ between warmup/timed runs (mirrors the
     natural PRNG drift in benchmark_recombination.py).
+
+    `timing_mode=False` (parity mode): both backends with instrument=True; C++
+    pre-prune OFF for byte-identical audit dicts. Wallclock includes
+    instrumentation overhead.
+
+    `timing_mode=True` (timing mode): both backends with instrument=False; C++
+    pre-prune at its production default (True). Wallclock is production-
+    relevant. Audit/stats dicts are populated where possible (Python audit is
+    always-on, C++ audit is unconditional too) but are NOT compared -- pre-prune
+    diverges them by design. The returned dict sets `audit_check` and `stats`
+    to None to signal "do not compare" downstream.
     """
     bench = _FakeBenchmark(num_offspring_per_couple=num_offspring_per_couple)
+    instrument = not timing_mode
 
     # --- Python reference ---
     g_py = pygrgl.load_mutable_grg(grg_path)
-    py_recomb = PyImpl(g_py, instrument=True)
+    py_recomb = PyImpl(g_py, instrument=instrument)
     py_offspring_per_gen = []
     py_total_t = 0.0
     for gen in range(num_generations):
@@ -117,13 +144,16 @@ def run_single_pass(grg_path, base_seed, num_generations, num_offspring_per_coup
 
     # --- C++ implementation ---
     g_cpp = pygrgl.load_mutable_grg(grg_path)
-    cpp_recomb = CppImpl(g_cpp, instrument=True)
-    # Disable the push-site pre-prune so the C++ visits the same nodes as the
-    # Python reference; otherwise the audit `visits`, `pruning`, and
-    # `skip_already_visited` counters diverge (correctly -- pre-prune skips
-    # visits Python would still pay for). The perf benefit of pre-prune is
-    # measured separately via `benchmark_recombination.py --diagnostics`.
-    cpp_recomb.pre_prune_enabled = False
+    cpp_recomb = CppImpl(g_cpp, instrument=instrument)
+    if not timing_mode:
+        # Parity mode: disable the push-site pre-prune so the C++ visits the same
+        # nodes as the Python reference; otherwise the audit `visits`, `pruning`,
+        # and `skip_already_visited` counters diverge (correctly -- pre-prune
+        # skips visits Python would still pay for). The perf benefit of pre-prune
+        # is measured by timing mode and by `benchmark_recombination.py
+        # --diagnostics`.
+        cpp_recomb.pre_prune_enabled = False
+    # Timing mode leaves pre_prune_enabled at its production default (True).
     cpp_offspring_per_gen = []
     cpp_total_t = 0.0
     for gen in range(num_generations):
@@ -136,36 +166,43 @@ def run_single_pass(grg_path, base_seed, num_generations, num_offspring_per_coup
     return {
         "py": {
             "offspring_per_gen": py_offspring_per_gen,
-            "audit": py_recomb.audit,
-            "stats": py_recomb.stats,
+            "audit": None if timing_mode else py_recomb.audit,
+            "stats": None if timing_mode else py_recomb.stats,
             "num_nodes": g_py.num_nodes,
             "num_edges": g_py.num_edges,
             "wallclock": py_total_t,
-            "audit_check": py_recomb.audit_check(raise_on_fail=False),
+            "audit_check": None if timing_mode else py_recomb.audit_check(raise_on_fail=False),
         },
         "cpp": {
             "offspring_per_gen": cpp_offspring_per_gen,
-            "audit": cpp_recomb.audit,
-            "stats": cpp_recomb.stats,
+            "audit": None if timing_mode else cpp_recomb.audit,
+            "stats": None if timing_mode else cpp_recomb.stats,
             "num_nodes": g_cpp.num_nodes,
             "num_edges": g_cpp.num_edges,
             "wallclock": cpp_total_t,
-            "audit_check": cpp_recomb.audit_check(raise_on_fail=False),
+            "audit_check": None if timing_mode else cpp_recomb.audit_check(raise_on_fail=False),
         },
     }
 
 
-def check_pass_parity(result):
+def check_pass_parity(result, timing_mode=False):
     """Returns (passed: bool, failures: list[str]) for one pass's result dict.
 
     Compared to compare_and_report below, this is the silent check used by each
     warmup/timed pass; reporting happens at the per-file summary level.
+
+    Timing mode skips audit-dict, audit-identity, and stats-key checks
+    (they don't apply when pre-prune is ON and instrument is OFF). Offspring
+    NodeID and GRG state checks still run -- pre-prune skips pruning-only
+    visits, so topology is unchanged.
     """
     py = result["py"]
     cpp = result["cpp"]
     failures = []
 
-    # (1) Offspring lists identical per generation.
+    # (1) Offspring lists identical per generation. Holds in both modes -- pre-
+    # prune skips only visits that would have been pure pruning, leaving the
+    # output topology untouched.
     for g, (po, co) in enumerate(zip(py["offspring_per_gen"], cpp["offspring_per_gen"])):
         if po != co:
             n_mismatch = sum(1 for a, b in zip(po, co) if a != b)
@@ -173,6 +210,18 @@ def check_pass_parity(result):
                 f"gen {g}: offspring lists differ ({n_mismatch}/{len(po)} mismatched, "
                 f"py len={len(po)} cpp len={len(co)})"
             )
+
+    # (3) GRG state matches. Holds in both modes for the same reason as (1).
+    if py["num_nodes"] != cpp["num_nodes"]:
+        failures.append(f"num_nodes mismatch py={py['num_nodes']} cpp={cpp['num_nodes']}")
+    if py["num_edges"] != cpp["num_edges"]:
+        failures.append(f"num_edges mismatch py={py['num_edges']} cpp={cpp['num_edges']}")
+
+    if timing_mode:
+        # Skip audit-dict, audit-identity, and stats-key checks. They don't apply:
+        # pre-prune is ON (audit `visits`/`pruning`/`skip_already_visited` diverge
+        # by design) and instrument=False zeros the C++ stats dict.
+        return (not failures, failures)
 
     # (2) Final audit dict matches.
     audit_keys = set(py["audit"].keys()) | set(cpp["audit"].keys())
@@ -182,12 +231,6 @@ def check_pass_parity(result):
         failures.append(f"audit diffs ({len(audit_diffs)}):")
         for k, pv, cv in audit_diffs[:10]:
             failures.append(f"  {k}: py={pv}, cpp={cv}")
-
-    # (3) GRG state matches.
-    if py["num_nodes"] != cpp["num_nodes"]:
-        failures.append(f"num_nodes mismatch py={py['num_nodes']} cpp={cpp['num_nodes']}")
-    if py["num_edges"] != cpp["num_edges"]:
-        failures.append(f"num_edges mismatch py={py['num_edges']} cpp={cpp['num_edges']}")
 
     # (4) Audit identities pass on both.
     for backend_name, ck in [("py", py["audit_check"]), ("cpp", cpp["audit_check"])]:
@@ -224,11 +267,13 @@ def run_file(grg_path, args):
     Each pass uses a distinct base_seed so warmup vs timed passes see different
     workloads (matching the natural PRNG drift in benchmark_recombination.py).
     Both backends within a single pass share that pass's seed, so they see
-    identical workloads -- the parity check is strict bit-for-bit.
+    identical workloads -- the parity check is strict bit-for-bit (or
+    topology-only in timing mode; see check_pass_parity).
     """
     name = os.path.basename(grg_path)
     total_passes = args.warmup + args.runs
-    print(f"\n=== {name} ===")
+    mode_label = "TIMING" if args.timing_mode else "PARITY"
+    print(f"\n=== {name}  [{mode_label} mode] ===")
     print(f"  warmup={args.warmup}  runs={args.runs}  num_generations={args.num_generations}")
 
     pass_records = []
@@ -246,8 +291,9 @@ def run_file(grg_path, args):
         result = run_single_pass(grg_path,
                                  pass_seed,
                                  args.num_generations,
-                                 args.offspring_per_couple)
-        passed, failures = check_pass_parity(result)
+                                 args.offspring_per_couple,
+                                 timing_mode=args.timing_mode)
+        passed, failures = check_pass_parity(result, timing_mode=args.timing_mode)
         overall_passed = overall_passed and passed
 
         py_t_ms = result["py"]["wallclock"] * 1000
@@ -282,11 +328,13 @@ def run_file(grg_path, args):
     cpp_mean, cpp_std = _mean_std(cpp_timed_times)
     speedup = py_mean / max(cpp_mean, 1e-12)
 
+    summary_marker = ("TIMING OK" if args.timing_mode else "PARITY OK") if overall_passed else (
+        "TIMING FAILURES" if args.timing_mode else "PARITY FAILURES")
     print(f"  --- aggregate over {args.runs} timed run(s) ---")
     print(f"  py  mean_time_ms = {py_mean*1000:9.2f} ± {py_std*1000:.2f}")
     print(f"  cpp mean_time_ms = {cpp_mean*1000:9.2f} ± {cpp_std*1000:.2f}")
     print(f"  speedup (mean)   = {speedup:.2f}x")
-    print(f"  result: {'PARITY OK' if overall_passed else 'PARITY FAILURES'}")
+    print(f"  result: {summary_marker}")
 
     return {
         "passed": overall_passed,
@@ -297,7 +345,8 @@ def run_file(grg_path, args):
         "speedup": speedup,
         "passes": pass_records,
         # Last pass's audit dicts -- useful for spot-checking from the JSON
-        # without bloating output with one audit dict per pass.
+        # without bloating output with one audit dict per pass. None in timing
+        # mode (audit comparison doesn't apply with pre-prune ON).
         "last_py_audit": last_result["py"]["audit"],
         "last_cpp_audit": last_result["cpp"]["audit"],
     }
@@ -321,8 +370,20 @@ def main():
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_PARITY_OUTPUT_DIR,
-        help=(f"Directory for the parity-result JSON. Auto-created if missing. "
+        help=(f"Directory for the result JSON. Auto-created if missing. "
               f"Default: {DEFAULT_PARITY_OUTPUT_DIR}"),
+    )
+    parser.add_argument(
+        "--timing-mode",
+        action="store_true",
+        help=(
+            "Switch to production-equivalent timing measurement: both backends "
+            "with instrument=False, C++ pre-prune ON (production default). "
+            "Audit/stats parity checks are skipped (they don't apply); "
+            "offspring NodeID and num_nodes/num_edges checks still run. Output "
+            "JSON is named `timing_results_<basename>.json` instead of "
+            "`parity_results_<basename>.json`."
+        ),
     )
     args = parser.parse_args()
 
@@ -333,8 +394,11 @@ def main():
     # Diagnostic banner: prints where each module was actually loaded from.
     # Run from inside vs outside benchmark/native/ should produce identical
     # paths here -- if they differ, the cluster is picking up a stale module.
+    mode_str = "TIMING (instrument=False, C++ pre-prune ON)" if args.timing_mode \
+        else "PARITY (instrument=True, C++ pre-prune OFF)"
     print("=" * 70)
     print(f"test_parity.py     : {_THIS_FILE}")
+    print(f"  mode             : {mode_str}")
     print(f"  BENCHMARK_DIR    : {BENCHMARK_DIR}")
     print(f"  REPO_ROOT        : {REPO_ROOT}")
     print(f"  cwd              : {os.getcwd()}")
@@ -365,15 +429,16 @@ def main():
         agg = run_file(grg_path, args)
         overall = overall and agg["passed"]
 
-        # Per-GRG output file, mirroring benchmark_recombination.py's pattern:
-        # benchmark_recombination_results_<basename>.{csv,json}
-        # -> parity_results_<basename>.json
-        # Basename strips the .grg extension; if multiple .grg files are passed
-        # they each get their own JSON, matching the benchmark naming convention.
+        # Per-GRG output file. Parity mode -> `parity_results_<basename>.json`;
+        # timing mode -> `timing_results_<basename>.json`. The different prefixes
+        # let downstream tooling (e.g. the comparison report) tell them apart
+        # without parsing the JSON.
         basename = os.path.splitext(os.path.basename(grg_path))[0]
-        output_path = os.path.join(output_dir, f"parity_results_{basename}.json")
+        prefix = "timing_results" if args.timing_mode else "parity_results"
+        output_path = os.path.join(output_dir, f"{prefix}_{basename}.json")
         record = {
             "timestamp": run_timestamp,
+            "mode": "timing" if args.timing_mode else "parity",
             "grg_file": os.path.basename(grg_path),
             "args": {
                 "seed": args.seed,
@@ -381,6 +446,7 @@ def main():
                 "offspring_per_couple": args.offspring_per_couple,
                 "warmup": args.warmup,
                 "runs": args.runs,
+                "timing_mode": args.timing_mode,
             },
             "parity_passed": agg["passed"],
             "py_mean_time_s": agg["py_mean_s"],
@@ -397,10 +463,14 @@ def main():
         print(f"  saved: {output_path}")
         written_paths.append(output_path)
 
-    print(f"\nParity results written to {len(written_paths)} file(s) in {output_dir}")
+    mode_word = "Timing" if args.timing_mode else "Parity"
+    print(f"\n{mode_word} results written to {len(written_paths)} file(s) in {output_dir}")
 
     print()
-    print("ALL PARITY TESTS PASSED" if overall else "PARITY FAILURES — see above")
+    if overall:
+        print(f"ALL {mode_word.upper()} CHECKS PASSED")
+    else:
+        print(f"{mode_word.upper()} FAILURES — see above")
     sys.exit(0 if overall else 1)
 
 
