@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""
+scaling_analysis.py — Analyze scaling sweep results and project NumPy times.
+
+Reads benchmark CSVs from a scaling sweep directory, fits scaling models
+to measured NumPy recombination times, validates via leave-one-out on the
+largest measured point, and projects to sizes where NumPy could not run.
+
+Usage:
+    python scaling_analysis.py --input-dir ./output/scaling_sweep
+    python scaling_analysis.py --input-dir ./output/scaling_sweep --output-dir ./output/scaling_sweep
+"""
+
+import argparse
+import csv
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+
+ALL_INDIVIDUALS = np.array([4000, 8000, 16000, 32000, 64000], dtype=float)
+ALL_SNPS = np.array([500_000, 1_000_000], dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_sweep_results(input_dir):
+    """Load all benchmark_recombination_results_*.csv files from input_dir."""
+    input_dir = Path(input_dir)
+    csv_files = sorted(input_dir.glob("benchmark_recombination_results_*.csv"))
+
+    if not csv_files:
+        print(f"No benchmark CSV files found in {input_dir}")
+        sys.exit(1)
+
+    int_fields = (
+        "num_samples_initial", "num_snps", "num_runs", "num_offspring",
+        "nodes_added", "edges_added",
+    )
+    float_fields = (
+        "mean_time_ms", "std_time_ms", "min_time_ms", "max_time_ms",
+        "memory_mb", "num_bp", "mean_bp",
+        "mean_dead_nodes", "mean_dead_pct", "mean_dead_mutations",
+        "mean_dead_edges", "mean_dead_edges_pct",
+    )
+
+    rows = []
+    for csv_file in csv_files:
+        with open(csv_file, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                for key in int_fields:
+                    if key in row and row[key]:
+                        row[key] = int(float(row[key]))
+                for key in float_fields:
+                    if key in row and row[key]:
+                        row[key] = float(row[key])
+                row["num_individuals"] = row["num_samples_initial"] // 2
+                rows.append(row)
+
+    print(f"Loaded {len(rows)} rows from {len(csv_files)} CSV files")
+    return rows
+
+
+def separate_by_impl(rows):
+    """Split rows into GRG and NumPy lists."""
+    grg = [r for r in rows if r["implementation"] == "GRG Native"]
+    numpy = [r for r in rows if r["implementation"] == "NumPy Baseline"]
+    return grg, numpy
+
+
+def filter_by_snps(rows, snps):
+    """Return rows matching a specific SNP count."""
+    return [r for r in rows if r["num_snps"] == snps]
+
+
+def extract_xy(rows, x_key="num_individuals", y_key="mean_time_ms"):
+    """Extract sorted (x, y, y_err) arrays from rows."""
+    if not rows:
+        return np.array([]), np.array([]), np.array([])
+    pairs = sorted(rows, key=lambda r: r[x_key])
+    x = np.array([r[x_key] for r in pairs], dtype=float)
+    y = np.array([r[y_key] for r in pairs], dtype=float)
+    y_err = np.array([r.get("std_time_ms", 0.0) for r in pairs], dtype=float)
+    return x, y, y_err
+
+
+# ---------------------------------------------------------------------------
+# Model fitting
+# ---------------------------------------------------------------------------
+
+def _r_squared(y_actual, y_predicted):
+    ss_res = np.sum((y_actual - y_predicted) ** 2)
+    ss_tot = np.sum((y_actual - np.mean(y_actual)) ** 2)
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else 0.0
+    return 1.0 - ss_res / ss_tot
+
+
+def _fit_linear(x, y):
+    coeffs = np.polyfit(x, y, 1)
+    pred_fn = lambda xn: np.polyval(coeffs, xn)
+    r2 = _r_squared(y, pred_fn(x))
+    return {
+        "name": "linear",
+        "coeffs": {"a": float(coeffs[0]), "b": float(coeffs[1])},
+        "formula": f"t = {coeffs[0]:.6e} * x + {coeffs[1]:.4f}",
+        "r_squared": float(r2),
+        "predict": pred_fn,
+    }
+
+
+def _fit_quadratic(x, y):
+    coeffs = np.polyfit(x, y, 2)
+    pred_fn = lambda xn: np.polyval(coeffs, xn)
+    r2 = _r_squared(y, pred_fn(x))
+    return {
+        "name": "quadratic",
+        "coeffs": {"a": float(coeffs[0]), "b": float(coeffs[1]), "c": float(coeffs[2])},
+        "formula": f"t = {coeffs[0]:.6e} * x^2 + {coeffs[1]:.6e} * x + {coeffs[2]:.4f}",
+        "r_squared": float(r2),
+        "predict": pred_fn,
+    }
+
+
+def _fit_power_law(x, y):
+    log_coeffs = np.polyfit(np.log(x), np.log(y), 1)
+    k = float(log_coeffs[0])
+    a = float(np.exp(log_coeffs[1]))
+    pred_fn = lambda xn: a * np.power(xn, k)
+    r2 = _r_squared(y, pred_fn(x))
+    return {
+        "name": "power_law",
+        "coeffs": {"a": a, "k": k},
+        "formula": f"t = {a:.6e} * x^{k:.4f}",
+        "r_squared": float(r2),
+        "predict": pred_fn,
+    }
+
+
+def fit_all_models(x, y):
+    """Fit linear, quadratic (if enough points), and power-law models."""
+    models = {}
+    if len(x) >= 2:
+        models["linear"] = _fit_linear(x, y)
+    if len(x) >= 3:
+        models["quadratic"] = _fit_quadratic(x, y)
+    if len(x) >= 2 and np.all(x > 0) and np.all(y > 0):
+        models["power_law"] = _fit_power_law(x, y)
+    return models
+
+
+def best_model_name(models):
+    """Return the name of the model with the highest R-squared."""
+    if not models:
+        return None
+    return max(models, key=lambda k: models[k]["r_squared"])
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-out validation
+# ---------------------------------------------------------------------------
+
+def leave_one_out(x, y):
+    """Drop the largest-x point, fit on the rest, predict it, report error."""
+    if len(x) < 3:
+        return {"error": "Need >= 3 measured points for LOO validation"}
+
+    order = np.argsort(x)
+    x_sorted, y_sorted = x[order], y[order]
+
+    x_train, y_train = x_sorted[:-1], y_sorted[:-1]
+    x_held, y_held = float(x_sorted[-1]), float(y_sorted[-1])
+
+    models = fit_all_models(x_train, y_train)
+    results = {}
+    for name, m in models.items():
+        y_pred = float(m["predict"](np.array([x_held]))[0])
+        abs_err = abs(y_pred - y_held)
+        rel_err = abs_err / y_held * 100 if y_held != 0 else float("inf")
+        results[name] = {
+            "x_held_out": x_held,
+            "y_actual": y_held,
+            "y_predicted": y_pred,
+            "abs_error_ms": abs_err,
+            "rel_error_pct": rel_err,
+            "r_squared_on_training": m["r_squared"],
+        }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Projection
+# ---------------------------------------------------------------------------
+
+def project_numpy_times(models, best_name, x_measured, x_all):
+    """Predict times for x values in x_all that have no measurement."""
+    x_missing = np.array([v for v in x_all if v not in set(x_measured)])
+    if len(x_missing) == 0 or best_name not in models:
+        return []
+
+    pred_fn = models[best_name]["predict"]
+    y_proj = pred_fn(x_missing)
+    return [
+        {"num_individuals": float(xv), "projected_time_ms": float(yv)}
+        for xv, yv in zip(x_missing, y_proj)
+    ]
+
+
+def numpy_memory_analytical(num_individuals, num_snps):
+    """Analytical NumPy matrix memory: mutations * 4n bytes (post-recomb)."""
+    return num_snps * 4.0 * num_individuals / (1024 ** 2)
+
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+
+def _snps_label(snps):
+    if snps >= 1_000_000 and snps % 1_000_000 == 0:
+        return f"{int(snps // 1_000_000)}m"
+    if snps >= 1_000 and snps % 1_000 == 0:
+        return f"{int(snps // 1_000)}k"
+    return str(int(snps))
+
+
+def _inds_ticks(x_vals):
+    """Human-readable tick labels for individual counts."""
+    labels = []
+    for v in x_vals:
+        if v >= 1000:
+            labels.append(f"{int(v // 1000)}k")
+        else:
+            labels.append(str(int(v)))
+    return labels
+
+
+def plot_time_vs_individuals(
+    grg_rows, numpy_rows, projections, models, best_name, snps,
+    output_path, loo_results=None,
+):
+    """Figure: time vs individuals at a fixed SNP count."""
+    if not HAS_MATPLOTLIB:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    snps_lbl = _snps_label(snps)
+
+    # GRG measured
+    grg_at = filter_by_snps(grg_rows, snps)
+    gx, gy, gy_err = extract_xy(grg_at)
+    if len(gx):
+        ax.errorbar(gx, gy, yerr=gy_err, marker="o", capsize=4,
+                     label="GRG Native (measured)", color="#2196F3", linewidth=2)
+
+    # NumPy measured
+    np_at = filter_by_snps(numpy_rows, snps)
+    nx, ny, ny_err = extract_xy(np_at)
+    if len(nx):
+        ax.errorbar(nx, ny, yerr=ny_err, marker="s", capsize=4,
+                     label="NumPy Baseline (measured)", color="#FF9800", linewidth=2)
+
+    # NumPy projected
+    proj_at = [p for p in projections if p.get("num_snps") == snps]
+    if proj_at:
+        px = np.array([p["num_individuals"] for p in proj_at])
+        py = np.array([p["projected_time_ms"] for p in proj_at])
+        if len(nx):
+            bridge_x = np.array([nx[-1], px[0]])
+            bridge_y = np.array([ny[-1], py[0]])
+            ax.plot(bridge_x, bridge_y, "--", color="#FF9800", alpha=0.5, linewidth=1.5)
+        ax.plot(px, py, "s", markersize=8, markerfacecolor="none",
+                markeredgecolor="#FF9800", markeredgewidth=2)
+        ax.plot(px, py, "--", color="#FF9800", alpha=0.5, linewidth=1.5,
+                label="NumPy Baseline (projected)")
+
+    # Fitted curve (faint, full range)
+    if best_name and best_name in models:
+        x_curve = np.linspace(ALL_INDIVIDUALS[0], ALL_INDIVIDUALS[-1], 200)
+        y_curve = models[best_name]["predict"](x_curve)
+        ax.plot(x_curve, y_curve, ":", color="#FF9800", alpha=0.3, linewidth=1,
+                label=f"Fit: {models[best_name]['formula']}")
+
+    # LOO annotation
+    if loo_results and best_name in loo_results:
+        loo = loo_results[best_name]
+        ax.annotate(
+            f"LOO: {loo['rel_error_pct']:.1f}% error",
+            xy=(loo["x_held_out"], loo["y_actual"]),
+            xytext=(15, 15), textcoords="offset points",
+            fontsize=9, color="gray",
+            arrowprops=dict(arrowstyle="->", color="gray", lw=0.8),
+        )
+
+    ax.set_xlabel("Number of Individuals", fontsize=12)
+    ax.set_ylabel("Mean Recombination Time (ms)", fontsize=12)
+    ax.set_title(f"Recombination Time vs Individuals ({snps_lbl} SNPs)", fontsize=14)
+    ax.set_xticks(ALL_INDIVIDUALS)
+    ax.set_xticklabels(_inds_ticks(ALL_INDIVIDUALS))
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
+def plot_time_vs_snps(grg_rows, numpy_rows, output_path):
+    """Figure: time vs SNPs, one line per individual count."""
+    if not HAS_MATPLOTLIB:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(ALL_INDIVIDUALS)))
+
+    for i, n_ind in enumerate(ALL_INDIVIDUALS):
+        ind_lbl = _inds_ticks([n_ind])[0]
+
+        grg_at = [r for r in grg_rows if r["num_individuals"] == n_ind]
+        gx, gy, gy_err = extract_xy(grg_at, x_key="num_snps")
+        if len(gx):
+            ax.errorbar(gx, gy, yerr=gy_err, marker="o", capsize=4,
+                         color=colors[i], linewidth=2,
+                         label=f"GRG {ind_lbl} inds")
+
+        np_at = [r for r in numpy_rows if r["num_individuals"] == n_ind]
+        nx, ny, ny_err = extract_xy(np_at, x_key="num_snps")
+        if len(nx):
+            ax.errorbar(nx, ny, yerr=ny_err, marker="s", capsize=4,
+                         color=colors[i], linewidth=2, linestyle="--",
+                         label=f"NumPy {ind_lbl} inds")
+
+    ax.set_xlabel("Number of SNPs", fontsize=12)
+    ax.set_ylabel("Mean Recombination Time (ms)", fontsize=12)
+    ax.set_title("Recombination Time vs Mutations", fontsize=14)
+    ax.set_xticks(ALL_SNPS)
+    ax.set_xticklabels([_snps_label(s) for s in ALL_SNPS])
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=9, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
+def plot_memory_vs_individuals(grg_rows, numpy_rows, output_path):
+    """Figure: memory vs individuals for both SNP counts."""
+    if not HAS_MATPLOTLIB:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for snps in ALL_SNPS:
+        snps_lbl = _snps_label(snps)
+
+        # GRG measured RSS
+        grg_at = filter_by_snps(grg_rows, snps)
+        gx, gy_mem, _ = extract_xy(grg_at, y_key="memory_mb")
+        if len(gx):
+            ax.plot(gx, gy_mem / 1024, marker="o", linewidth=2,
+                    label=f"GRG RSS ({snps_lbl} SNPs)")
+
+        # NumPy analytical memory (full range)
+        mem_all = np.array([numpy_memory_analytical(n, snps) for n in ALL_INDIVIDUALS])
+        ax.plot(ALL_INDIVIDUALS, mem_all / 1024, marker="s", linewidth=2,
+                linestyle="--", label=f"NumPy matrix ({snps_lbl} SNPs)")
+
+    # 128 GB system limit
+    ax.axhline(y=128, color="red", linestyle=":", linewidth=1.5, alpha=0.7,
+               label="System limit (128 GB)")
+
+    ax.set_xlabel("Number of Individuals", fontsize=12)
+    ax.set_ylabel("Memory (GB)", fontsize=12)
+    ax.set_title("Memory Usage vs Individuals", fontsize=14)
+    ax.set_xticks(ALL_INDIVIDUALS)
+    ax.set_xticklabels(_inds_ticks(ALL_INDIVIDUALS))
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def save_summary_csv(grg_rows, numpy_rows, projections, output_path):
+    """Write a unified CSV with measured + projected rows."""
+    fieldnames = [
+        "num_individuals", "num_snps", "implementation",
+        "mean_time_ms", "std_time_ms", "memory_mb", "source",
+    ]
+
+    rows_out = []
+    for r in grg_rows:
+        rows_out.append({
+            "num_individuals": r["num_individuals"],
+            "num_snps": r["num_snps"],
+            "implementation": "GRG Native",
+            "mean_time_ms": f"{r['mean_time_ms']:.4f}",
+            "std_time_ms": f"{r.get('std_time_ms', 0.0):.4f}",
+            "memory_mb": f"{r['memory_mb']:.1f}",
+            "source": "measured",
+        })
+    for r in numpy_rows:
+        rows_out.append({
+            "num_individuals": r["num_individuals"],
+            "num_snps": r["num_snps"],
+            "implementation": "NumPy Baseline",
+            "mean_time_ms": f"{r['mean_time_ms']:.4f}",
+            "std_time_ms": f"{r.get('std_time_ms', 0.0):.4f}",
+            "memory_mb": f"{r['memory_mb']:.1f}",
+            "source": "measured",
+        })
+    for p in projections:
+        n_ind = p["num_individuals"]
+        snps = p["num_snps"]
+        mem = numpy_memory_analytical(n_ind, snps)
+        rows_out.append({
+            "num_individuals": int(n_ind),
+            "num_snps": int(snps),
+            "implementation": "NumPy Baseline",
+            "mean_time_ms": f"{p['projected_time_ms']:.4f}",
+            "std_time_ms": "NaN",
+            "memory_mb": f"{mem:.1f}",
+            "source": f"projected ({p.get('model_used', 'unknown')})",
+        })
+
+    rows_out.sort(key=lambda r: (r["implementation"], int(r["num_snps"]), int(r["num_individuals"])))
+
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_out)
+
+    print(f"  Saved {output_path}")
+
+
+def save_model_fits_json(all_fits, output_path):
+    """Save model fit details, LOO results, and projections to JSON."""
+    serializable = {}
+    for key, val in all_fits.items():
+        entry = {}
+        for subkey, subval in val.items():
+            if subkey == "models":
+                entry["models"] = {
+                    name: {k: v for k, v in m.items() if k != "predict"}
+                    for name, m in subval.items()
+                }
+            else:
+                entry[subkey] = subval
+        serializable[key] = entry
+
+    with open(output_path, "w") as f:
+        json.dump(serializable, f, indent=2)
+
+    print(f"  Saved {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def analyze_sweep_axis(numpy_rows, snps, label):
+    """Run full analysis for one sweep axis (fixed SNP count, vary individuals).
+
+    Returns (models, best_name, loo_results, projections).
+    """
+    np_at = filter_by_snps(numpy_rows, snps)
+    x, y, _ = extract_xy(np_at)
+
+    print(f"\n{'='*60}")
+    print(f"Sweep: {label} (fixed {_snps_label(snps)} SNPs)")
+    print(f"  Measured NumPy points: {len(x)}")
+
+    if len(x) < 2:
+        print("  Not enough points for model fitting (need >= 2)")
+        return {}, None, {}, []
+
+    for xi, yi in zip(x, y):
+        print(f"    {_inds_ticks([xi])[0]} inds -> {yi:.2f} ms")
+
+    # Fit models
+    models = fit_all_models(x, y)
+    best = best_model_name(models)
+
+    print(f"\n  Model fits:")
+    for name, m in models.items():
+        marker = " <-- best" if name == best else ""
+        print(f"    {name:12s}  R²={m['r_squared']:.6f}  {m['formula']}{marker}")
+
+    # LOO validation
+    loo_results = leave_one_out(x, y)
+    if "error" not in loo_results:
+        print(f"\n  Leave-one-out (held out: {_inds_ticks([x[-1]])[0]} inds):")
+        for name, res in loo_results.items():
+            print(f"    {name:12s}  predicted={res['y_predicted']:.2f} ms  "
+                  f"actual={res['y_actual']:.2f} ms  "
+                  f"error={res['rel_error_pct']:.1f}%")
+    else:
+        print(f"\n  LOO: {loo_results['error']}")
+
+    # Project
+    measured_inds = set(x.tolist())
+    projections = project_numpy_times(models, best, x, ALL_INDIVIDUALS)
+    for p in projections:
+        p["num_snps"] = snps
+        p["model_used"] = best
+    if projections:
+        print(f"\n  Projections (model: {best}):")
+        for p in projections:
+            print(f"    {_inds_ticks([p['num_individuals']])[0]} inds -> "
+                  f"{p['projected_time_ms']:.2f} ms (projected)")
+    else:
+        print(f"\n  No projections needed (all points measured)")
+
+    return models, best, loo_results, projections
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Analyze scaling sweep results and project NumPy times."
+    )
+    parser.add_argument(
+        "--input-dir", type=Path, required=True,
+        help="Directory containing benchmark CSV files from the scaling sweep",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Directory for output files. Defaults to --input-dir.",
+    )
+    args = parser.parse_args()
+
+    output_dir = args.output_dir or args.input_dir
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Load data
+    rows = load_sweep_results(args.input_dir)
+    grg_rows, numpy_rows = separate_by_impl(rows)
+    print(f"  GRG rows: {len(grg_rows)}, NumPy rows: {len(numpy_rows)}")
+
+    # 2. Analyze each sweep axis
+    all_fits = {}
+    all_projections = []
+
+    for snps in ALL_SNPS:
+        snps_lbl = _snps_label(snps)
+        models, best, loo, projections = analyze_sweep_axis(
+            numpy_rows, snps, f"vary_individuals_{snps_lbl}",
+        )
+        all_fits[f"individuals_at_{snps_lbl}"] = {
+            "models": models,
+            "best_model": best,
+            "loo_validation": loo,
+            "projections": projections,
+        }
+        all_projections.extend(projections)
+
+    # 3. Generate figures
+    if not HAS_MATPLOTLIB:
+        print("\nSkipping figures (matplotlib not installed)")
+    else:
+        print(f"\nGenerating figures...")
+
+        for snps in ALL_SNPS:
+            snps_lbl = _snps_label(snps)
+            fit_info = all_fits.get(f"individuals_at_{snps_lbl}", {})
+            proj_at_snps = [p for p in all_projections if p.get("num_snps") == snps]
+            plot_time_vs_individuals(
+                grg_rows, numpy_rows, proj_at_snps,
+                fit_info.get("models", {}),
+                fit_info.get("best_model"),
+                snps,
+                figures_dir / f"time_vs_individuals_{snps_lbl}.png",
+                loo_results=fit_info.get("loo_validation"),
+            )
+
+        plot_time_vs_snps(grg_rows, numpy_rows,
+                          figures_dir / "time_vs_snps.png")
+
+        plot_memory_vs_individuals(grg_rows, numpy_rows,
+                                   figures_dir / "memory_vs_individuals.png")
+
+    # 4. Save outputs
+    print(f"\nSaving outputs...")
+    save_summary_csv(grg_rows, numpy_rows, all_projections,
+                     output_dir / "scaling_summary.csv")
+    save_model_fits_json(all_fits, output_dir / "scaling_model_fits.json")
+
+    # 5. Final summary
+    print(f"\n{'='*60}")
+    print("Summary")
+    print(f"{'='*60}")
+    print(f"  Measured points:  GRG={len(grg_rows)}, NumPy={len(numpy_rows)}")
+    print(f"  Projected points: {len(all_projections)}")
+    for snps in ALL_SNPS:
+        snps_lbl = _snps_label(snps)
+        fit_info = all_fits.get(f"individuals_at_{snps_lbl}", {})
+        best = fit_info.get("best_model")
+        if best and best in fit_info.get("models", {}):
+            m = fit_info["models"][best]
+            print(f"  Best model at {snps_lbl} SNPs: {best} "
+                  f"(R²={m['r_squared']:.6f})")
+    if HAS_MATPLOTLIB:
+        print(f"  Figures in: {figures_dir}")
+    print(f"  Summary CSV: {output_dir / 'scaling_summary.csv'}")
+    print(f"  Model fits:  {output_dir / 'scaling_model_fits.json'}")
+
+
+if __name__ == "__main__":
+    main()
