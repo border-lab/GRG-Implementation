@@ -187,10 +187,19 @@ def fit_all_models(x, y):
     return models
 
 
-def best_model_name(models):
-    """Return the name of the model with the highest R-squared."""
+def best_model_name(models, loo_results=None):
+    """Return the best model name.
+
+    When LOO results are available, pick the model with the lowest LOO
+    relative error (generalization ability). Fall back to highest R-squared
+    when LOO is unavailable or has errors.
+    """
     if not models:
         return None
+    if loo_results and "error" not in loo_results:
+        candidates = {k: v for k, v in loo_results.items() if k in models}
+        if candidates:
+            return min(candidates, key=lambda k: candidates[k]["rel_error_pct"])
     return max(models, key=lambda k: models[k]["r_squared"])
 
 
@@ -584,21 +593,25 @@ def analyze_sweep_axis(numpy_rows, snps, label):
 
     # Fit models
     models = fit_all_models(x, y)
-    best = best_model_name(models)
+
+    # LOO validation (run before model selection so LOO informs the choice)
+    loo_results = leave_one_out(x, y)
+
+    # Select best model: prefer lowest LOO error when available, else highest R²
+    best = best_model_name(models, loo_results)
 
     print(f"\n  Model fits:")
     for name, m in models.items():
         marker = " <-- best" if name == best else ""
         print(f"    {name:12s}  R²={m['r_squared']:.6f}  {m['formula']}{marker}")
 
-    # LOO validation
-    loo_results = leave_one_out(x, y)
     if "error" not in loo_results:
         print(f"\n  Leave-one-out (held out: {_inds_ticks([x[-1]])[0]} inds):")
         for name, res in loo_results.items():
+            marker = " <-- best" if name == best else ""
             print(f"    {name:12s}  predicted={res['y_predicted']:.2f} ms  "
                   f"actual={res['y_actual']:.2f} ms  "
-                  f"error={res['rel_error_pct']:.1f}%")
+                  f"error={res['rel_error_pct']:.1f}%{marker}")
     else:
         print(f"\n  LOO: {loo_results['error']}")
 
