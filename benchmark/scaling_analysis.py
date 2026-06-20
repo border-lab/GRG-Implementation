@@ -30,7 +30,7 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 
-ALL_INDIVIDUALS = np.array([4000, 8000, 16000, 32000, 64000], dtype=float)
+ALL_INDIVIDUALS = np.array([4000, 6000, 8000, 12000, 16000, 32000, 64000], dtype=float)
 ALL_SNPS = np.array([500_000, 1_000_000], dtype=float)
 
 
