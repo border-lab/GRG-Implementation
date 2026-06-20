@@ -116,3 +116,11 @@ These are the load-bearing invariants. Touching them silently breaks correctness
 - The repo-root `grg.py` is **not** what `benchmark/grg_recombination.py` uses; don't conflate the two when editing.
 - `grg_files/` and `benchmark/output/` are gitignored; expect them to be empty on a fresh clone (use `generate_grg.py`).
 - The diagnostic flags in `benchmark_recombination.py` are all gated behind explicit booleans — leaving them on for the headline timing comparison contaminates the numbers (snapshot capture, etc., explicitly pause the wallclock, but instrument=True does add ~150 ns per moved mutation).
+
+## Instructions for AI Assistants
+
+- **NEVER add "Co-Authored-By: Claude" or any similar AI attribution to commits, code, or documentation**
+- Do not add any co-author, contributor, or attribution lines referencing AI/Claude/LLM assistance
+- **Update changelogs when making changes:**
+  - Software changes → `CHANGELOG.md`
+  - Dev workflow changes → `CHANGELOG.dev.md`
