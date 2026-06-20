@@ -14,6 +14,7 @@ Usage:
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -36,6 +37,25 @@ ALL_SNPS = np.array([500_000, 1_000_000], dtype=float)
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
+def _parse_target_snps(filename):
+    """Parse the intended SNP target from a filename like '4000inds_500k_snps.grg'.
+
+    The actual num_snps in the CSV is a Poisson realization (e.g. 499832),
+    not the exact target. This function recovers the round target from the
+    filename so we can group rows by intended sweep category.
+    """
+    m = re.search(r"(\d+)([kKmM])?_snps", filename)
+    if not m:
+        return None
+    val = int(m.group(1))
+    suffix = (m.group(2) or "").lower()
+    if suffix == "k":
+        return val * 1_000
+    if suffix == "m":
+        return val * 1_000_000
+    return val
+
 
 def load_sweep_results(input_dir):
     """Load all benchmark_recombination_results_*.csv files from input_dir."""
@@ -69,6 +89,10 @@ def load_sweep_results(input_dir):
                     if key in row and row[key]:
                         row[key] = float(row[key])
                 row["num_individuals"] = row["num_samples_initial"] // 2
+                # Parse target SNP count from filename (round number used
+                # for grouping) instead of actual num_snps (Poisson count).
+                target = _parse_target_snps(row.get("file", ""))
+                row["snps_target"] = target if target is not None else row["num_snps"]
                 rows.append(row)
 
     print(f"Loaded {len(rows)} rows from {len(csv_files)} CSV files")
@@ -83,8 +107,8 @@ def separate_by_impl(rows):
 
 
 def filter_by_snps(rows, snps):
-    """Return rows matching a specific SNP count."""
-    return [r for r in rows if r["num_snps"] == snps]
+    """Return rows matching a target SNP category (parsed from filename)."""
+    return [r for r in rows if r["snps_target"] == snps]
 
 
 def extract_xy(rows, x_key="num_individuals", y_key="mean_time_ms"):
@@ -333,14 +357,14 @@ def plot_time_vs_snps(grg_rows, numpy_rows, output_path):
         ind_lbl = _inds_ticks([n_ind])[0]
 
         grg_at = [r for r in grg_rows if r["num_individuals"] == n_ind]
-        gx, gy, gy_err = extract_xy(grg_at, x_key="num_snps")
+        gx, gy, gy_err = extract_xy(grg_at, x_key="snps_target")
         if len(gx):
             ax.errorbar(gx, gy, yerr=gy_err, marker="o", capsize=4,
                          color=colors[i], linewidth=2,
                          label=f"GRG {ind_lbl} inds")
 
         np_at = [r for r in numpy_rows if r["num_individuals"] == n_ind]
-        nx, ny, ny_err = extract_xy(np_at, x_key="num_snps")
+        nx, ny, ny_err = extract_xy(np_at, x_key="snps_target")
         if len(nx):
             ax.errorbar(nx, ny, yerr=ny_err, marker="s", capsize=4,
                          color=colors[i], linewidth=2, linestyle="--",
@@ -417,7 +441,7 @@ def save_summary_csv(grg_rows, numpy_rows, projections, output_path):
     for r in grg_rows:
         rows_out.append({
             "num_individuals": r["num_individuals"],
-            "num_snps": r["num_snps"],
+            "num_snps": int(r["snps_target"]),
             "implementation": "GRG Native",
             "mean_time_ms": f"{r['mean_time_ms']:.4f}",
             "std_time_ms": f"{r.get('std_time_ms', 0.0):.4f}",
@@ -427,7 +451,7 @@ def save_summary_csv(grg_rows, numpy_rows, projections, output_path):
     for r in numpy_rows:
         rows_out.append({
             "num_individuals": r["num_individuals"],
-            "num_snps": r["num_snps"],
+            "num_snps": int(r["snps_target"]),
             "implementation": "NumPy Baseline",
             "mean_time_ms": f"{r['mean_time_ms']:.4f}",
             "std_time_ms": f"{r.get('std_time_ms', 0.0):.4f}",
