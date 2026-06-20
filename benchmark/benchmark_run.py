@@ -37,6 +37,7 @@ import argparse
 import platform
 import tempfile
 import re
+import threading
 import numpy as np
 from pathlib import Path
 
@@ -62,6 +63,60 @@ from multitree_check import compute_post_recomb_anc_counts, check_offspring, com
 
 def get_process_memory_mb():
     return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+
+
+class PeakRSSTracker:
+    """Background thread that polls process RSS to capture peak memory usage.
+
+    Usage:
+        tracker = PeakRSSTracker(interval=0.1)
+        tracker.start()
+        # ... work ...
+        tracker.stop()
+        print(tracker.peak_mb, tracker.baseline_mb)
+    """
+
+    def __init__(self, interval=0.1):
+        self._interval = interval
+        self._process = psutil.Process(os.getpid())
+        self._peak = 0.0
+        self._baseline = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._baseline = self._process.memory_info().rss / (1024 * 1024)
+        self._peak = self._baseline
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def _poll(self):
+        while not self._stop.is_set():
+            rss = self._process.memory_info().rss / (1024 * 1024)
+            if rss > self._peak:
+                self._peak = rss
+            self._stop.wait(self._interval)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        rss = self._process.memory_info().rss / (1024 * 1024)
+        if rss > self._peak:
+            self._peak = rss
+
+    @property
+    def peak_mb(self):
+        return self._peak
+
+    @property
+    def baseline_mb(self):
+        return self._baseline
+
+    @property
+    def peak_delta_mb(self):
+        return self._peak - self._baseline
 
 
 def parse_expected_size(filename):
@@ -179,6 +234,8 @@ def run_grg(
 
     gc.collect()
     mem_before = get_process_memory_mb()
+    peak_tracker = PeakRSSTracker(interval=0.1)
+    peak_tracker.start()
 
     total_bp = 0
     all_offspring_ids = []
@@ -242,6 +299,7 @@ def run_grg(
     elapsed = time.perf_counter() - start
     print(f"[GRG run {run_index}] Done in {elapsed:.4f}s")
 
+    peak_tracker.stop()
     gc.collect()
     mem_after = get_process_memory_mb()
 
@@ -251,7 +309,15 @@ def run_grg(
     result["nodes_added"] = g.num_nodes - base_nodes
     result["edges_added"] = g.num_edges - base_edges
     result["memory_mb"] = mem_after
+    result["memory_before_mb"] = mem_before
     result["memory_delta_mb"] = mem_after - mem_before
+    result["memory_peak_mb"] = peak_tracker.peak_mb
+    result["memory_peak_delta_mb"] = peak_tracker.peak_delta_mb
+
+    print(f"[GRG run {run_index}] Memory: before={mem_before:.1f} MB, "
+          f"after={mem_after:.1f} MB, delta={mem_after - mem_before:+.1f} MB, "
+          f"peak={peak_tracker.peak_mb:.1f} MB, "
+          f"peak_delta={peak_tracker.peak_delta_mb:+.1f} MB")
 
     if diagnostics and liveness_snapshots:
         liveness_keys = (
