@@ -157,6 +157,24 @@ def _fill_shared_breakpoints_k_offspring(matrix, p1, p2, bp, k, row_base, dest):
             dest[row_base + j, a:bnd] = matrix[parent, a:bnd]
 
 
+def _map_bp_to_columns(bp, bp_range, num_columns):
+    """Map breakpoints from physical genome coordinates to matrix column indices.
+
+    Breakpoints are drawn from bp_range (e.g. 0–1,000,000 bp) but the genotype
+    matrix has num_columns columns (= num_mutations, which may differ from the
+    genome length). Scale proportionally, deduplicate, and clip to [1, num_columns-1].
+    """
+    if len(bp) == 0:
+        return bp
+    low, high = bp_range
+    span = high - low
+    if span <= 0:
+        return bp
+    scaled = np.round((bp - low) / span * num_columns).astype(int)
+    scaled = np.clip(scaled, 1, num_columns - 1)
+    return np.unique(scaled)
+
+
 def simulate_numpy_recombination(benchmark, genotype_matrix, bp_range, expected_crossovers=1.5):
     """
     Recombination on a dense (samples x loci) matrix.
@@ -192,6 +210,8 @@ def simulate_numpy_recombination(benchmark, genotype_matrix, bp_range, expected_
 
         bp, num_bp = benchmark.get_breakpoints(bp_range, expected_crossovers)
         total_bp += num_bp
+
+        bp = _map_bp_to_columns(bp, bp_range, genome_length)
 
         _fill_shared_breakpoints_k_offspring(
             genotype_matrix,
