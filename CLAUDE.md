@@ -45,9 +45,46 @@ cd benchmark
 ```
 Key flags: `--input-trees <file.trees>` to skip msprime; `--method {ts,vcf,trees}` picks the conversion path; segment-size auto-derived as `max(200_000, 12.5 * num_samples)` (see `_derive_segment_size`).
 
-### Run the recombination benchmark
+### Run the recombination benchmark (two-stage pipeline)
+
+The benchmark system is split into two stages: **run** and **aggregate**.
+
+**Stage 1 — `benchmark_run.py`**: executes exactly one run of one method on one file.
 ```bash
 cd benchmark
+# GRG run:
+../.venv/bin/python benchmark_run.py \
+    --grg-file ../grg_files/4000inds_500k_snps.grg \
+    --method grg --run-index 0 \
+    --num-generations 1 --offspring-per-couple 2 \
+    --output-dir ./output/runs
+
+# NumPy run:
+../.venv/bin/python benchmark_run.py \
+    --grg-file ../grg_files/4000inds_500k_snps.grg \
+    --method numpy --run-index 0 \
+    --num-generations 1 --offspring-per-couple 2 \
+    --output-dir ./output/runs
+```
+Writes one JSON per run (e.g. `run_4000inds_500k_snps_grg_0.json`). Optional flags (GRG only): `--verification`, `--diagnostics`, `--serialize`, `--profile`, `--seed`.
+
+**Stage 2 — `benchmark_aggregate.py`**: reads all per-run JSONs, groups by (file, method), computes mean/std/min/max, writes combined CSV + JSON.
+```bash
+../.venv/bin/python benchmark_aggregate.py \
+    --input-dir ./output/runs \
+    --output-dir ./output \
+    --output-prefix benchmark_recombination_results
+```
+
+**SLURM submission** (each tier has a run script + aggregate script):
+```bash
+BATCH_JOB=$(sbatch --parsable sweep_tier1.sh)
+sbatch --dependency=afterok:$BATCH_JOB sweep_tier1_aggregate.sh
+```
+The run scripts use `--array` to fan out over the `(file, method, run_index)` matrix. The aggregate scripts run after all array tasks succeed.
+
+**Legacy monolithic mode** (`benchmark_recombination.py`) still works for local/interactive use:
+```bash
 ../.venv/bin/python benchmark_recombination.py \
     --grg-dir ../grg_files \
     --warmup 1 --runs 3 \
@@ -55,9 +92,9 @@ cd benchmark
     --offspring-per-couple 2 \
     --output-dir ./output
 ```
-Outputs CSV + JSON to `--output-dir` (default `.`). Off-the-timed-path diagnostic flags (each adds wallclock but **does not** affect the headline mean_time_ms):
 
-- `--skip-numpy` — skip the dense NumPy baseline (memory blows up past ~16k inds at 1M SNPs).
+Off-the-timed-path diagnostic flags (apply to both `benchmark_run.py --method grg` and `benchmark_recombination.py`; each adds wallclock but **does not** affect the headline mean_time_ms):
+
 - `--diagnostics` — instrumented diagnostic pass (phase breakdowns, per-C++-call costs, audit-1 histogram), structural-stats fingerprint, and per-generation liveness/deadweight snapshots.
 - `--verification` — after each non-warmup run: (1) audit identity checks on accumulated counters; (2) per-offspring multitree cardinality check (Approach B in `multitree_check.py`). Expensive at biobank scale.
 - `--serialize` — after each generation of the last timed run, do `pygrgl.save_grg + load_mutable_grg`, report (nodes, edges) pre/post and save+load wallclock. Passive (graph is **not** replaced with the reloaded version).
@@ -66,6 +103,12 @@ Outputs CSV + JSON to `--output-dir` (default `.`). Off-the-timed-path diagnosti
 ### Smoke-test a single file
 ```bash
 cd benchmark
+# New pipeline (one run, no aggregation needed for smoke tests):
+../.venv/bin/python benchmark_run.py \
+    --grg-file ../grg_files/50inds_1k_snps.grg \
+    --method grg --run-index 0 --num-generations 1
+
+# Legacy:
 ../.venv/bin/python benchmark_recombination.py \
     --grg-dir ../grg_files/50inds_1k_snps.grg \
     --warmup 0 --runs 1 --num-generations 1 --skip-numpy
@@ -115,7 +158,9 @@ These are the load-bearing invariants. Touching them silently breaks correctness
 - Don't run benchmark scripts without sourcing `.venv` first — `pygrgl` will be missing and msprime/tskit will resolve to the wrong Python.
 - The repo-root `grg.py` is **not** what `benchmark/grg_recombination.py` uses; don't conflate the two when editing.
 - `grg_files/` and `benchmark/output/` are gitignored; expect them to be empty on a fresh clone (use `generate_grg.py`).
-- The diagnostic flags in `benchmark_recombination.py` are all gated behind explicit booleans — leaving them on for the headline timing comparison contaminates the numbers (snapshot capture, etc., explicitly pause the wallclock, but instrument=True does add ~150 ns per moved mutation).
+- The diagnostic flags in `benchmark_run.py` and `benchmark_recombination.py` are all gated behind explicit booleans — leaving them on for the headline timing comparison contaminates the numbers (snapshot capture, etc., explicitly pause the wallclock, but instrument=True does add ~150 ns per moved mutation).
+- `benchmark_run.py` writes per-run JSONs; `benchmark_aggregate.py` combines them. Don't confuse the per-run JSON (one timing measurement) with the aggregated JSON (mean/std across runs). The SLURM `*_aggregate.sh` scripts must run **after** all array tasks finish (`--dependency=afterok`).
+- The SLURM `.sh` scripts are gitignored — they live on the cluster and are not tracked. Only `benchmark_run.py` and `benchmark_aggregate.py` are committed.
 
 ## Instructions for AI Assistants
 
