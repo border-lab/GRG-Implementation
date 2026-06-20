@@ -379,15 +379,18 @@ def plot_time_vs_individuals(
             arrowprops=dict(arrowstyle="->", color="gray", lw=0.8),
         )
 
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlabel("Number of Individuals", fontsize=12)
     ax.set_ylabel("Mean Recombination Time (ms)", fontsize=12)
     ax.set_title(f"Recombination Time vs Individuals ({snps_lbl} SNPs)", fontsize=14)
     ax.set_xticks(ALL_INDIVIDUALS)
     ax.set_xticklabels(_inds_ticks(ALL_INDIVIDUALS))
+    ax.xaxis.set_minor_formatter(plt.NullFormatter())
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -419,6 +422,7 @@ def plot_time_vs_snps(grg_rows, numpy_rows, output_path):
                          color=colors[i], linewidth=2, linestyle="--",
                          label=f"NumPy {ind_lbl} inds")
 
+    ax.set_yscale("log")
     ax.set_xlabel("Number of SNPs", fontsize=12)
     ax.set_ylabel("Mean Recombination Time (ms)", fontsize=12)
     ax.set_title("Recombination Time vs Mutations", fontsize=14)
@@ -427,7 +431,7 @@ def plot_time_vs_snps(grg_rows, numpy_rows, output_path):
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(fontsize=9, ncol=2)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -460,15 +464,18 @@ def plot_memory_vs_individuals(grg_rows, numpy_rows, output_path):
     ax.axhline(y=128, color="red", linestyle=":", linewidth=1.5, alpha=0.7,
                label="System limit (128 GB)")
 
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlabel("Number of Individuals", fontsize=12)
     ax.set_ylabel("Memory (GB)", fontsize=12)
     ax.set_title("Memory Usage vs Individuals", fontsize=14)
     ax.set_xticks(ALL_INDIVIDUALS)
     ax.set_xticklabels(_inds_ticks(ALL_INDIVIDUALS))
+    ax.xaxis.set_minor_formatter(plt.NullFormatter())
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
