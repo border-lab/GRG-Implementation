@@ -195,6 +195,55 @@ def best_model_name(models):
 
 
 # ---------------------------------------------------------------------------
+# Combined 2D model fitting (all NumPy points together)
+# ---------------------------------------------------------------------------
+
+def fit_combined_2d(numpy_rows):
+    """Fit t = a*individuals + b*mutations + c using all NumPy data points.
+
+    Returns a dict with coefficients, predict function, R², residuals,
+    or None if there are fewer than 3 points.
+    """
+    if len(numpy_rows) < 3:
+        return None
+
+    n = np.array([r["num_individuals"] for r in numpy_rows], dtype=float)
+    m = np.array([r["snps_target"] for r in numpy_rows], dtype=float)
+    t = np.array([r["mean_time_ms"] for r in numpy_rows], dtype=float)
+
+    X = np.column_stack([n, m, np.ones(len(n))])
+    coeffs, residuals, rank, sv = np.linalg.lstsq(X, t, rcond=None)
+    a, b, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+
+    def pred_fn(n_val, m_val):
+        n_val = np.asarray(n_val, dtype=float)
+        m_val = np.asarray(m_val, dtype=float)
+        return a * n_val + b * m_val + c
+
+    t_pred = pred_fn(n, m)
+    r2 = float(_r_squared(t, t_pred))
+
+    per_point = []
+    for i, row in enumerate(numpy_rows):
+        per_point.append({
+            "num_individuals": int(n[i]),
+            "num_snps": int(m[i]),
+            "actual_ms": float(t[i]),
+            "predicted_ms": float(t_pred[i]),
+            "residual_ms": float(t[i] - t_pred[i]),
+        })
+
+    return {
+        "name": "combined_2d_linear",
+        "coeffs": {"a_per_individual": a, "b_per_mutation": b, "c_constant": c},
+        "formula": f"t = {a:.6e} * n + {b:.6e} * m + {c:.4f}",
+        "r_squared": r2,
+        "predict": pred_fn,
+        "per_point_residuals": per_point,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Leave-one-out validation
 # ---------------------------------------------------------------------------
 
@@ -586,9 +635,52 @@ def main():
     grg_rows, numpy_rows = separate_by_impl(rows)
     print(f"  GRG rows: {len(grg_rows)}, NumPy rows: {len(numpy_rows)}")
 
-    # 2. Analyze each sweep axis
-    all_fits = {}
+    # 2. Combined 2D model (all NumPy points together)
+    combined = fit_combined_2d(numpy_rows)
     all_projections = []
+
+    if combined:
+        print(f"\n{'='*60}")
+        print("Combined 2D Model (all NumPy points)")
+        print(f"  {combined['formula']}")
+        print(f"  R² = {combined['r_squared']:.6f}")
+        coeffs = combined["coeffs"]
+        print(f"  Per-individual contribution: {coeffs['a_per_individual']:.4f} ms/individual")
+        print(f"  Per-mutation contribution:   {coeffs['b_per_mutation']:.6f} ms/mutation")
+        print(f"  Constant baseline:           {coeffs['c_constant']:.2f} ms")
+
+        print(f"\n  Per-point residuals:")
+        for pt in combined["per_point_residuals"]:
+            ind_lbl = _inds_ticks([pt["num_individuals"]])[0]
+            snp_lbl = _snps_label(pt["num_snps"])
+            print(f"    {ind_lbl}/{snp_lbl}: actual={pt['actual_ms']:.1f}  "
+                  f"predicted={pt['predicted_ms']:.1f}  "
+                  f"residual={pt['residual_ms']:+.1f} ms")
+
+        # Project to all unmeasured (individuals, mutations) combos
+        measured_pairs = {
+            (r["num_individuals"], int(r["snps_target"])) for r in numpy_rows
+        }
+        print(f"\n  Projections:")
+        for n_ind in ALL_INDIVIDUALS:
+            for snps in ALL_SNPS:
+                if (n_ind, int(snps)) in measured_pairs:
+                    continue
+                t_proj = float(combined["predict"](n_ind, snps))
+                all_projections.append({
+                    "num_individuals": float(n_ind),
+                    "num_snps": float(snps),
+                    "projected_time_ms": t_proj,
+                    "model_used": "combined_2d_linear",
+                })
+                ind_lbl = _inds_ticks([n_ind])[0]
+                snp_lbl = _snps_label(snps)
+                print(f"    {ind_lbl}/{snp_lbl} -> {t_proj:.2f} ms")
+    else:
+        print("\n  Not enough NumPy points for combined 2D model (need >= 3)")
+
+    # 3. Per-sweep analysis (secondary, for comparison)
+    all_fits = {}
 
     for snps in ALL_SNPS:
         snps_lbl = _snps_label(snps)
@@ -601,9 +693,21 @@ def main():
             "loo_validation": loo,
             "projections": projections,
         }
-        all_projections.extend(projections)
 
-    # 3. Generate figures
+    if combined:
+        all_fits["combined_2d"] = {
+            "name": combined["name"],
+            "coeffs": combined["coeffs"],
+            "formula": combined["formula"],
+            "r_squared": combined["r_squared"],
+            "per_point_residuals": combined["per_point_residuals"],
+            "projections": [
+                {k: v for k, v in p.items() if k != "predict"}
+                for p in all_projections
+            ],
+        }
+
+    # 4. Generate figures
     if not HAS_MATPLOTLIB:
         print("\nSkipping figures (matplotlib not installed)")
     else:
@@ -611,15 +715,23 @@ def main():
 
         for snps in ALL_SNPS:
             snps_lbl = _snps_label(snps)
-            fit_info = all_fits.get(f"individuals_at_{snps_lbl}", {})
             proj_at_snps = [p for p in all_projections if p.get("num_snps") == snps]
+            combined_models = {}
+            combined_best = None
+            if combined:
+                combined_pred_at_snps = lambda xn, _s=snps, _c=combined: _c["predict"](xn, _s)
+                combined_models["combined_2d"] = {
+                    "predict": combined_pred_at_snps,
+                    "formula": combined["formula"],
+                    "r_squared": combined["r_squared"],
+                }
+                combined_best = "combined_2d"
             plot_time_vs_individuals(
                 grg_rows, numpy_rows, proj_at_snps,
-                fit_info.get("models", {}),
-                fit_info.get("best_model"),
+                combined_models,
+                combined_best,
                 snps,
                 figures_dir / f"time_vs_individuals_{snps_lbl}.png",
-                loo_results=fit_info.get("loo_validation"),
             )
 
         plot_time_vs_snps(grg_rows, numpy_rows,
@@ -628,25 +740,28 @@ def main():
         plot_memory_vs_individuals(grg_rows, numpy_rows,
                                    figures_dir / "memory_vs_individuals.png")
 
-    # 4. Save outputs
+    # 5. Save outputs
     print(f"\nSaving outputs...")
     save_summary_csv(grg_rows, numpy_rows, all_projections,
                      output_dir / "scaling_summary.csv")
     save_model_fits_json(all_fits, output_dir / "scaling_model_fits.json")
 
-    # 5. Final summary
+    # 6. Final summary
     print(f"\n{'='*60}")
     print("Summary")
     print(f"{'='*60}")
     print(f"  Measured points:  GRG={len(grg_rows)}, NumPy={len(numpy_rows)}")
     print(f"  Projected points: {len(all_projections)}")
+    if combined:
+        print(f"  Combined 2D model: {combined['formula']}  "
+              f"(R²={combined['r_squared']:.6f})")
     for snps in ALL_SNPS:
         snps_lbl = _snps_label(snps)
         fit_info = all_fits.get(f"individuals_at_{snps_lbl}", {})
         best = fit_info.get("best_model")
         if best and best in fit_info.get("models", {}):
             m = fit_info["models"][best]
-            print(f"  Best model at {snps_lbl} SNPs: {best} "
+            print(f"  Per-sweep at {snps_lbl} SNPs: {best} "
                   f"(R²={m['r_squared']:.6f})")
     if HAS_MATPLOTLIB:
         print(f"  Figures in: {figures_dir}")
