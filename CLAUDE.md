@@ -133,6 +133,8 @@ cd benchmark
 ../.venv/bin/python haplotype_oracle.py ../grg_files/<file>.grg --offspring-per-couple 2 --num-generations 1
 ```
 
+All test and benchmark output (JSON results, CSV summaries, verification dumps) must be written to `benchmark/output/`, using subdirectories by type where appropriate (e.g. `output/runs/`, `output/parity/`). Never write output files directly into `benchmark/` or the repo root.
+
 There are no unit tests — the test surface is the audit-identity checks + multitree cardinality check + haplotype oracle exercised via `--verification`, plus `manual_toy_data_test.py` and the `test*.py` scripts at the root for the pure-Python reference.
 
 ## Architecture notes for the benchmark recombination
