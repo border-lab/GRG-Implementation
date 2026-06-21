@@ -29,6 +29,13 @@ Or invoke the interpreter directly: `.venv/bin/python <script>` (from `benchmark
 
 `benchmark/requirements.txt` lists *only* the minimal extras (`numpy`, `tqdm`, `packaging`); `pygrgl`, `msprime`, `tskit`, `psutil`, `joblib` are already installed in `.venv`.
 
+### Build the C++ native recombination backend
+```bash
+cd benchmark/native
+GRGL_ROOT=../../grgl pip install -e .
+```
+This compiles the C++ recombiner extension (`grg_recomb_native`). Once installed, set `GRG_BACKEND=cpp` to use the native backend instead of the Python one (e.g. `GRG_BACKEND=cpp ../.venv/bin/python benchmark_run.py ...`).
+
 ## Common commands
 
 ### Toy / repo-root scripts
@@ -96,7 +103,7 @@ The run scripts use `--array` to fan out over the `(file, method, run_index)` ma
 Off-the-timed-path diagnostic flags (apply to both `benchmark_run.py --method grg` and `benchmark_recombination.py`; each adds wallclock but **does not** affect the headline mean_time_ms):
 
 - `--diagnostics` — instrumented diagnostic pass (phase breakdowns, per-C++-call costs, audit-1 histogram), structural-stats fingerprint, and per-generation liveness/deadweight snapshots.
-- `--verification` — after each non-warmup run: (1) audit identity checks on accumulated counters; (2) per-offspring multitree cardinality check (Approach B in `multitree_check.py`). Expensive at biobank scale.
+- `--verification` — after each non-warmup run: (1) audit identity checks on accumulated counters; (2) per-offspring multitree cardinality check (Approach B in `multitree_check.py`); (3) haplotype oracle (`haplotype_oracle.py`) — verifies each offspring carries exactly the mutations expected from splicing its parents' haplotypes at the recorded breakpoints. Expensive at biobank scale.
 - `--serialize` — after each generation of the last timed run, do `pygrgl.save_grg + load_mutable_grg`, report (nodes, edges) pre/post and save+load wallclock. Passive (graph is **not** replaced with the reloaded version).
 - `--profile` — one extra generation under `cProfile`, top 30 by cumtime + tottime.
 
@@ -120,7 +127,13 @@ cd benchmark
 ../.venv/bin/python multitree_check.py ../grg_files/<file>.grg --offspring-per-couple 2
 ```
 
-There are no unit tests — the test surface is the audit-identity checks + multitree cardinality check exercised via `--verification`, plus `manual_toy_data_test.py` and the `test*.py` scripts at the root for the pure-Python reference.
+### Standalone haplotype oracle
+```bash
+cd benchmark
+../.venv/bin/python haplotype_oracle.py ../grg_files/<file>.grg --offspring-per-couple 2 --num-generations 1
+```
+
+There are no unit tests — the test surface is the audit-identity checks + multitree cardinality check + haplotype oracle exercised via `--verification`, plus `manual_toy_data_test.py` and the `test*.py` scripts at the root for the pure-Python reference.
 
 ## Architecture notes for the benchmark recombination
 

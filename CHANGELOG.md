@@ -19,6 +19,12 @@ For development workflow changes (testing, CI/CD, tooling), see [devtools/CHANGE
   `benchmark_run.py`, groups by (file, method), computes summary statistics
   (mean/std/min/max), and writes combined CSV + JSON matching the original
   `benchmark_recombination.py` output format.
+- `benchmark/haplotype_oracle.py` — per-offspring mutation correctness
+  verification. For each offspring, walks up the GRG to collect inherited
+  mutations and compares against the expected set derived from the parent
+  haplotypes and recombination breakpoints. Integrated into `--verification`
+  in both `benchmark_run.py` and `benchmark_recombination.py`. Also usable
+  as a standalone CLI.
 
 ### Changed
 

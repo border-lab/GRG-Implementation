@@ -40,6 +40,7 @@ else:
     from grg_recombination import NonDuplicationRecombination
 from grg_numpy_baseline import grg_to_numpy, grg_to_numpy_parallel, estimate_numpy_memory, simulate_numpy_recombination
 from multitree_check import compute_post_recomb_anc_counts, check_offspring, compute_liveness
+from haplotype_oracle import check_offspring_haplotypes
 
 # DEBUG Mode
 debug = True
@@ -391,6 +392,7 @@ class RecombinationBenchmarker:
                 print(f"\n  [Run {i+1}] Simulating {self.num_generations} generations with GRG recombination...")
             total_grg_bp = 0
             all_offspring_ids = []
+            offspring_ledger = [] if self.verification else None
             start = time.perf_counter()
             recomb = NonDuplicationRecombination(g)
             for gen in range(self.num_generations):
@@ -399,7 +401,10 @@ class RecombinationBenchmarker:
                     print(f"\n    [Gen {gen+1}] Simulating generation {gen+1} with GRG recombination...")
                 # pr = cProfile.Profile()
                 # pr.enable()
-                offspring_ids, gen_bp = simulate_grg_recombination(self, recomb, base_genome, N=base_genome[1])
+                offspring_ids, gen_bp = simulate_grg_recombination(
+                    self, recomb, base_genome, N=base_genome[1],
+                    generation_index=gen, offspring_ledger=offspring_ledger,
+                )
                 # pr.disable()
                 # pstats.Stats(pr).sort_stats('cumtime').print_stats(25)  # Print top 25 cumulative time functions
                 all_offspring_ids.extend(offspring_ids)
@@ -532,6 +537,21 @@ class RecombinationBenchmarker:
                       f"offspring violate ({100*mt_sum['violation_rate']:.2f}%); "
                       f"{mt_sum['total_redundant_paths']:,} redundant paths total")
 
+                # (3) Haplotype oracle: per-offspring mutation correctness.
+                ho_t0 = time.perf_counter()
+                ho_result = check_offspring_haplotypes(g, offspring_ledger)
+                ho_elapsed = time.perf_counter() - ho_t0
+                print(f"  [Run {i+1}] Haplotype oracle: "
+                      f"{ho_result['num_pass']}/{ho_result['total_checked']} "
+                      f"pass in {ho_elapsed:.2f}s")
+                if ho_result['num_fail'] > 0:
+                    print(f"  [Run {i+1}] WARNING: {ho_result['num_fail']} "
+                          f"offspring have incorrect mutations!")
+                    for fail in ho_result['failures'][:3]:
+                        print(f"    offspring {fail['offspring_id']}: "
+                              f"{fail['missing_count']} missing, "
+                              f"{fail['extra_count']} extra")
+
                 self.diagnostics.setdefault(file_path.name, {}) \
                     .setdefault('verification_checks', []).append({
                         'run_index': i,
@@ -542,6 +562,14 @@ class RecombinationBenchmarker:
                             'offspring_checked_across_gens': len(all_offspring_ids),
                             'summary': mt_sum,
                             'first_example': mt_result['first_example'],
+                        },
+                        'haplotype_oracle': {
+                            'wallclock_s': ho_elapsed,
+                            'total_checked': ho_result['total_checked'],
+                            'num_pass': ho_result['num_pass'],
+                            'num_fail': ho_result['num_fail'],
+                            'all_pass': ho_result['all_pass'],
+                            'failures': ho_result['failures'],
                         },
                     })
 

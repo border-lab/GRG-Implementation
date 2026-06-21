@@ -59,6 +59,7 @@ from grg_numpy_baseline import (
     simulate_numpy_recombination,
 )
 from multitree_check import compute_post_recomb_anc_counts, check_offspring, compute_liveness
+from haplotype_oracle import check_offspring_haplotypes
 
 
 def get_process_memory_mb():
@@ -252,13 +253,15 @@ def run_grg(
     total_bp = 0
     all_offspring_ids = []
     liveness_snapshots = []
+    offspring_ledger = [] if verification else None
 
     start = time.perf_counter()
     recomb = NonDuplicationRecombination(g)
     for gen in range(num_generations):
         print(f"  [Gen {gen+1}] Running GRG recombination...")
         offspring_ids, gen_bp = simulate_grg_recombination(
-            provider, recomb, base_genome, N=base_genome[1]
+            provider, recomb, base_genome, N=base_genome[1],
+            generation_index=gen, offspring_ledger=offspring_ledger,
         )
         all_offspring_ids.extend(offspring_ids)
         total_bp += gen_bp
@@ -382,6 +385,17 @@ def run_grg(
         print(f"  Multitree check: {mt_sum['violating']:,}/{mt_sum['total_checked']:,} "
               f"violate ({100*mt_sum['violation_rate']:.2f}%) in {mt_elapsed:.2f}s")
 
+        ho_t0 = time.perf_counter()
+        ho_result = check_offspring_haplotypes(g, offspring_ledger)
+        ho_elapsed = time.perf_counter() - ho_t0
+        print(f"  Haplotype oracle: {ho_result['num_pass']}/{ho_result['total_checked']} "
+              f"pass in {ho_elapsed:.2f}s")
+        if ho_result['num_fail'] > 0:
+            print(f"  WARNING: {ho_result['num_fail']} offspring have incorrect mutations!")
+            for fail in ho_result['failures'][:3]:
+                print(f"    offspring {fail['offspring_id']}: "
+                      f"{fail['missing_count']} missing, {fail['extra_count']} extra")
+
         result["verification"] = {
             "audit": audit_results,
             "multitree": {
@@ -389,6 +403,14 @@ def run_grg(
                 "offspring_checked": len(all_offspring_ids),
                 "summary": mt_sum,
                 "first_example": mt_result['first_example'],
+            },
+            "haplotype_oracle": {
+                "wallclock_s": ho_elapsed,
+                "total_checked": ho_result['total_checked'],
+                "num_pass": ho_result['num_pass'],
+                "num_fail": ho_result['num_fail'],
+                "all_pass": ho_result['all_pass'],
+                "failures": ho_result['failures'],
             },
         }
 

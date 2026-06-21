@@ -7,8 +7,17 @@ Optimized core module containing the Non-duplication GRG recombination algorithm
 import bisect
 import time
 from collections import deque
+from typing import NamedTuple
 
 import numpy as np
+
+
+class OffspringRecord(NamedTuple):
+    offspring_id: int
+    parent_a: int
+    parent_b: int
+    segments: list
+    generation: int
 
 
 def _summary(xs):
@@ -1083,7 +1092,8 @@ class NonDuplicationRecombination:
         print("\n".join(lines))
 
 
-def simulate_grg_recombination(benchmark, recomb, bp_range, N):
+def simulate_grg_recombination(benchmark, recomb, bp_range, N,
+                                generation_index=0, offspring_ledger=None):
     total_bp = 0
     samples = np.array(recomb.grg.get_sample_nodes())
     np.random.shuffle(samples)
@@ -1109,6 +1119,13 @@ def simulate_grg_recombination(benchmark, recomb, bp_range, N):
                 offspring_id = recomb.recombine_multi(segments)
                 raw_id = recomb.NEGATIVE_NODE_IDS[abs(offspring_id) - 1]
                 new_offspring_ids.append(raw_id)
+
+                if offspring_ledger is not None:
+                    offspring_ledger.append(OffspringRecord(
+                        offspring_id=raw_id, parent_a=int(p1),
+                        parent_b=int(p2), segments=list(segments),
+                        generation=generation_index,
+                    ))
 
         new_offspring_ids.sort()
         recomb.grg.set_samples(new_offspring_ids)
