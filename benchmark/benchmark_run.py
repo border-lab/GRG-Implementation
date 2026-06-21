@@ -232,6 +232,18 @@ def run_grg(
         gc.collect()
         g = pygrgl.load_mutable_grg(str(grg_file))
 
+    # Measure pre-recombination graph size (off the timed path).
+    # save_grg writes a compact serialization — this is the direct analog
+    # to NumPy's matrix byte count.
+    with tempfile.NamedTemporaryFile(suffix='.grg', delete=False) as _tf:
+        _pre_grg_tmp = _tf.name
+    try:
+        pygrgl.save_grg(g, _pre_grg_tmp)
+        grg_file_size_before_mb = os.path.getsize(_pre_grg_tmp) / (1024 * 1024)
+    finally:
+        if os.path.exists(_pre_grg_tmp):
+            os.remove(_pre_grg_tmp)
+
     gc.collect()
     mem_before = get_process_memory_mb()
     peak_tracker = PeakRSSTracker(interval=0.1)
@@ -303,6 +315,16 @@ def run_grg(
     gc.collect()
     mem_after = get_process_memory_mb()
 
+    # Measure post-recombination graph size (off the timed path).
+    with tempfile.NamedTemporaryFile(suffix='.grg', delete=False) as _tf:
+        _post_grg_tmp = _tf.name
+    try:
+        pygrgl.save_grg(g, _post_grg_tmp)
+        grg_file_size_after_mb = os.path.getsize(_post_grg_tmp) / (1024 * 1024)
+    finally:
+        if os.path.exists(_post_grg_tmp):
+            os.remove(_post_grg_tmp)
+
     result["time_ms"] = elapsed * 1000
     result["total_bp"] = total_bp
     result["mean_bp"] = total_bp / num_generations
@@ -313,11 +335,17 @@ def run_grg(
     result["memory_delta_mb"] = mem_after - mem_before
     result["memory_peak_mb"] = peak_tracker.peak_mb
     result["memory_peak_delta_mb"] = peak_tracker.peak_delta_mb
+    result["grg_file_size_before_mb"] = grg_file_size_before_mb
+    result["grg_file_size_after_mb"] = grg_file_size_after_mb
+    result["grg_file_size_delta_mb"] = grg_file_size_after_mb - grg_file_size_before_mb
 
     print(f"[GRG run {run_index}] Memory: before={mem_before:.1f} MB, "
           f"after={mem_after:.1f} MB, delta={mem_after - mem_before:+.1f} MB, "
           f"peak={peak_tracker.peak_mb:.1f} MB, "
           f"peak_delta={peak_tracker.peak_delta_mb:+.1f} MB")
+    print(f"[GRG run {run_index}] Graph size: before={grg_file_size_before_mb:.1f} MB, "
+          f"after={grg_file_size_after_mb:.1f} MB, "
+          f"delta={grg_file_size_after_mb - grg_file_size_before_mb:+.1f} MB")
 
     if diagnostics and liveness_snapshots:
         liveness_keys = (
