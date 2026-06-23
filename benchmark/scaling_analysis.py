@@ -593,6 +593,102 @@ def plot_memory_vs_individuals(grg_rows, numpy_rows, output_path):
     print(f"  Saved {output_path}")
 
 
+def plot_memory_vs_time(grg_rows, numpy_rows, projections, snps, output_path):
+    """Figure: data structure size (y) vs recombination time (x) at fixed SNPs.
+
+    GRG memory = serialized graph file size (grg_file_size_after_mb).
+    NumPy memory = analytical matrix size (mutations * 4 * individuals).
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    snps_lbl = _snps_label(snps)
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # GRG: use grg_file_size_after_mb if available, else memory_mb
+    grg_at = filter_by_snps(grg_rows, snps)
+    grg_at = sorted(grg_at, key=lambda r: r["num_individuals"])
+    grg_time = []
+    grg_mem = []
+    grg_labels = []
+    for r in grg_at:
+        grg_time.append(r["mean_time_ms"] / 1000)
+        mem = r.get("grg_file_size_after_mb", r.get("memory_mb", 0))
+        grg_mem.append(mem / 1024)
+        grg_labels.append(_inds_ticks([r["num_individuals"]])[0])
+
+    if grg_time:
+        ax.plot(grg_time, grg_mem, "o-", color="#2196F3", linewidth=2.5,
+                markersize=10, label="GRG Native (graph size)", zorder=5)
+
+    # NumPy measured
+    np_at = filter_by_snps(numpy_rows, snps)
+    np_at = sorted(np_at, key=lambda r: r["num_individuals"])
+    np_time_m, np_mem_m, np_labels_m = [], [], []
+    for r in np_at:
+        np_time_m.append(r["mean_time_ms"] / 1000)
+        np_mem_m.append(numpy_memory_analytical(r["num_individuals"], snps) / 1024)
+        np_labels_m.append(_inds_ticks([r["num_individuals"]])[0])
+
+    if np_time_m:
+        ax.plot(np_time_m, np_mem_m, "s-", color="#FF9800", markersize=10,
+                linewidth=2.5, label="NumPy Baseline (matrix size, measured time)",
+                zorder=5)
+
+    # NumPy projected
+    proj_at = sorted(
+        [p for p in projections if p.get("num_snps") == snps],
+        key=lambda p: p["num_individuals"],
+    )
+    if proj_at:
+        np_time_p = [p["projected_time_ms"] / 1000 for p in proj_at]
+        np_mem_p = [numpy_memory_analytical(p["num_individuals"], snps) / 1024
+                    for p in proj_at]
+        np_labels_p = [_inds_ticks([p["num_individuals"]])[0] for p in proj_at]
+
+        bridge_x = [np_time_m[-1]] + np_time_p if np_time_m else np_time_p
+        bridge_y = [np_mem_m[-1]] + np_mem_p if np_mem_m else np_mem_p
+        ax.plot(bridge_x, bridge_y, "--", color="#FF9800", alpha=0.6,
+                linewidth=2, zorder=4)
+        ax.plot(np_time_p, np_mem_p, "s", markersize=10, markerfacecolor="none",
+                markeredgecolor="#FF9800", markeredgewidth=2.5,
+                label="NumPy Baseline (projected time)", zorder=5)
+    else:
+        np_time_p, np_mem_p, np_labels_p = [], [], []
+
+    # Annotate points
+    for i, lbl in enumerate(grg_labels):
+        offset = (10, -5) if i == len(grg_labels) - 1 else (10, -18)
+        ax.annotate(lbl, (grg_time[i], grg_mem[i]),
+                    textcoords="offset points", xytext=offset,
+                    fontsize=10, fontweight="bold", color="#1565C0")
+
+    for i, lbl in enumerate(np_labels_m):
+        ax.annotate(lbl, (np_time_m[i], np_mem_m[i]),
+                    textcoords="offset points", xytext=(-5, 10),
+                    fontsize=10, fontweight="bold", color="#E65100")
+
+    for i, lbl in enumerate(np_labels_p):
+        ax.annotate(lbl, (np_time_p[i], np_mem_p[i]),
+                    textcoords="offset points", xytext=(-30, 10),
+                    fontsize=10, fontweight="bold", color="#E65100")
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Recombination Time (seconds, log scale)", fontsize=13)
+    ax.set_ylabel("Data Structure Size (GB, log scale)", fontsize=13)
+    ax.set_title(f"Data Structure Size vs Time — GRG vs NumPy ({snps_lbl} SNPs)",
+                 fontsize=14)
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend(fontsize=10, loc="upper left")
+    ax.grid(True, alpha=0.3, which="both")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {output_path}")
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -861,6 +957,14 @@ def main():
 
         plot_memory_vs_individuals(grg_rows, numpy_rows,
                                    figures_dir / "memory_vs_individuals.png")
+
+        for snps in ALL_SNPS:
+            snps_lbl = _snps_label(snps)
+            proj_at_snps = [p for p in all_projections if p.get("num_snps") == snps]
+            plot_memory_vs_time(
+                grg_rows, numpy_rows, proj_at_snps, snps,
+                figures_dir / f"memory_vs_time_{snps_lbl}.png",
+            )
 
     # 5. Save outputs
     print(f"\nSaving outputs...")
