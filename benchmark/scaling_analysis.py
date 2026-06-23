@@ -57,14 +57,72 @@ def _parse_target_snps(filename):
     return val
 
 
-def load_sweep_results(input_dir):
-    """Load all benchmark_recombination_results_*.csv files from input_dir."""
+def _load_per_run_jsons(input_dir):
+    """Load per-run JSONs from benchmark_run.py and aggregate into rows.
+
+    Groups runs by (file, method), computes mean/std/min/max across runs,
+    and returns rows in the same schema as the CSV loader.
+    """
+    input_dir = Path(input_dir)
+    json_files = sorted(input_dir.glob("run_*_*.json"))
+    if not json_files:
+        return []
+
+    raw = []
+    for jf in json_files:
+        with open(jf, "r") as f:
+            raw.append(json.load(f))
+
+    groups = {}
+    for r in raw:
+        key = (r["file"], r["method"])
+        groups.setdefault(key, []).append(r)
+
+    rows = []
+    for (fname, method), runs in groups.items():
+        impl = "GRG Native" if method == "grg" else "NumPy Baseline"
+        times = [r["time_ms"] for r in runs]
+        bps = [r["total_bp"] for r in runs]
+        first = runs[0]
+
+        row = {
+            "file": fname,
+            "implementation": impl,
+            "num_samples_initial": first["num_samples_initial"],
+            "num_snps": first["num_snps"],
+            "num_offspring": first["num_offspring"],
+            "num_runs": len(runs),
+            "num_bp": sum(bps),
+            "mean_bp": np.mean([r["mean_bp"] for r in runs]),
+            "mean_time_ms": float(np.mean(times)),
+            "std_time_ms": float(np.std(times)),
+            "min_time_ms": float(np.min(times)),
+            "max_time_ms": float(np.max(times)),
+            "nodes_added": np.mean([r.get("nodes_added", 0) for r in runs]),
+            "edges_added": np.mean([r.get("edges_added", 0) for r in runs]),
+            "memory_mb": np.mean([r.get("memory_mb", 0) for r in runs]),
+        }
+
+        if method == "grg":
+            row["memory_before_mb"] = np.mean([r.get("memory_before_mb", 0) for r in runs])
+            row["memory_delta_mb"] = np.mean([r.get("memory_delta_mb", 0) for r in runs])
+            row["memory_peak_mb"] = np.mean([r.get("memory_peak_mb", 0) for r in runs])
+            row["memory_peak_delta_mb"] = np.mean([r.get("memory_peak_delta_mb", 0) for r in runs])
+            row["grg_file_size_before_mb"] = np.mean([r.get("grg_file_size_before_mb", 0) for r in runs])
+            row["grg_file_size_after_mb"] = np.mean([r.get("grg_file_size_after_mb", 0) for r in runs])
+            row["grg_file_size_delta_mb"] = np.mean([r.get("grg_file_size_delta_mb", 0) for r in runs])
+
+        rows.append(row)
+
+    return rows
+
+
+def _load_legacy_csvs(input_dir):
+    """Load benchmark_recombination_results_*.csv files (legacy format)."""
     input_dir = Path(input_dir)
     csv_files = sorted(input_dir.glob("benchmark_recombination_results_*.csv"))
-
     if not csv_files:
-        print(f"No benchmark CSV files found in {input_dir}")
-        sys.exit(1)
+        return []
 
     int_fields = (
         "num_samples_initial", "num_snps", "num_runs", "num_offspring",
@@ -88,14 +146,58 @@ def load_sweep_results(input_dir):
                 for key in float_fields:
                     if key in row and row[key]:
                         row[key] = float(row[key])
-                row["num_individuals"] = row["num_samples_initial"] // 2
-                # Parse target SNP count from filename (round number used
-                # for grouping) instead of actual num_snps (Poisson count).
-                target = _parse_target_snps(row.get("file", ""))
-                row["snps_target"] = target if target is not None else row["num_snps"]
                 rows.append(row)
 
-    print(f"Loaded {len(rows)} rows from {len(csv_files)} CSV files")
+    print(f"  Loaded {len(rows)} rows from {len(csv_files)} legacy CSV files")
+    return rows
+
+
+def load_sweep_results(input_dir):
+    """Load results from per-run JSONs and/or legacy CSVs.
+
+    Searches input_dir for per-run JSONs (from benchmark_run.py) first.
+    Falls back to legacy CSVs (from benchmark_recombination.py) if no
+    JSONs are found. If both exist, merges them (JSONs take priority for
+    duplicates keyed on file+implementation).
+    """
+    input_dir = Path(input_dir)
+
+    json_rows = _load_per_run_jsons(input_dir)
+    csv_rows = _load_legacy_csvs(input_dir)
+
+    if not json_rows and not csv_rows:
+        print(f"No benchmark data found in {input_dir}")
+        sys.exit(1)
+
+    # Merge: JSONs take priority over CSVs for the same (file, impl) pair
+    seen = set()
+    rows = []
+    for r in json_rows:
+        key = (r["file"], r["implementation"])
+        seen.add(key)
+        rows.append(r)
+    for r in csv_rows:
+        key = (r.get("file", ""), r.get("implementation", ""))
+        if key not in seen:
+            rows.append(r)
+
+    # Derive common fields
+    for row in rows:
+        if "num_individuals" not in row:
+            row["num_individuals"] = row["num_samples_initial"] // 2
+        target = _parse_target_snps(row.get("file", ""))
+        row["snps_target"] = target if target is not None else row["num_snps"]
+
+    json_count = len(json_rows)
+    csv_count = len(csv_rows) - len([r for r in csv_rows
+                                      if (r.get("file", ""), r.get("implementation", "")) in seen])
+    total = len(rows)
+    sources = []
+    if json_count:
+        sources.append(f"{json_count} from per-run JSONs")
+    if csv_count > 0:
+        sources.append(f"{csv_count} from legacy CSVs")
+    print(f"Loaded {total} rows ({', '.join(sources)})")
     return rows
 
 

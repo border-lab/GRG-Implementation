@@ -52,6 +52,8 @@ cd benchmark
 ```
 Key flags: `--input-trees <file.trees>` to skip msprime; `--method {ts,vcf,trees}` picks the conversion path; segment-size auto-derived as `max(200_000, 12.5 * num_samples)` (see `_derive_segment_size`).
 
+**Sequence length convention**: when generating tree sequences for benchmarking, use `sequence_length = target_mutations * 100` (~100 bp/SNP, human-like density). For example, 500k SNPs → `--sequence-length 50000000`, 1m SNPs → `--sequence-length 100000000`. All GRG files in a comparison sweep must use the same formula — mismatched sequence lengths produce GRGs with different internal structures that are not comparable.
+
 ### Run the recombination benchmark (two-stage pipeline)
 
 The benchmark system is split into two stages: **run** and **aggregate**.
