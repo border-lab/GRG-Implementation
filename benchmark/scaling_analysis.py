@@ -448,24 +448,24 @@ def plot_time_vs_individuals(
     grg_at = filter_by_snps(grg_rows, snps)
     gx, gy, gy_err = extract_xy(grg_at)
     if len(gx):
-        ax.errorbar(gx, gy, yerr=gy_err, marker="o", capsize=4,
+        ax.errorbar(gx, gy / 1000, yerr=gy_err / 1000, marker="o", capsize=4,
                      label="GRG Native (measured)", color="#2196F3", linewidth=2)
 
     # NumPy measured
     np_at = filter_by_snps(numpy_rows, snps)
     nx, ny, ny_err = extract_xy(np_at)
     if len(nx):
-        ax.errorbar(nx, ny, yerr=ny_err, marker="s", capsize=4,
+        ax.errorbar(nx, ny / 1000, yerr=ny_err / 1000, marker="s", capsize=4,
                      label="NumPy Baseline (measured)", color="#FF9800", linewidth=2)
 
     # NumPy projected
     proj_at = [p for p in projections if p.get("num_snps") == snps]
     if proj_at:
         px = np.array([p["num_individuals"] for p in proj_at])
-        py = np.array([p["projected_time_ms"] for p in proj_at])
+        py = np.array([p["projected_time_ms"] for p in proj_at]) / 1000
         if len(nx):
             bridge_x = np.array([nx[-1], px[0]])
-            bridge_y = np.array([ny[-1], py[0]])
+            bridge_y = np.array([ny[-1] / 1000, py[0]])
             ax.plot(bridge_x, bridge_y, "--", color="#FF9800", alpha=0.5, linewidth=1.5)
         ax.plot(px, py, "s", markersize=8, markerfacecolor="none",
                 markeredgecolor="#FF9800", markeredgewidth=2)
@@ -475,7 +475,7 @@ def plot_time_vs_individuals(
     # Fitted curve (faint, full range)
     if best_name and best_name in models:
         x_curve = np.linspace(ALL_INDIVIDUALS[0], ALL_INDIVIDUALS[-1], 200)
-        y_curve = models[best_name]["predict"](x_curve)
+        y_curve = models[best_name]["predict"](x_curve) / 1000
         ax.plot(x_curve, y_curve, ":", color="#FF9800", alpha=0.3, linewidth=1,
                 label=f"Fit: {models[best_name]['formula']}")
 
@@ -484,7 +484,7 @@ def plot_time_vs_individuals(
         loo = loo_results[best_name]
         ax.annotate(
             f"LOO: {loo['rel_error_pct']:.1f}% error",
-            xy=(loo["x_held_out"], loo["y_actual"]),
+            xy=(loo["x_held_out"], loo["y_actual"] / 1000),
             xytext=(15, 15), textcoords="offset points",
             fontsize=9, color="gray",
             arrowprops=dict(arrowstyle="->", color="gray", lw=0.8),
@@ -493,7 +493,7 @@ def plot_time_vs_individuals(
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Number of Individuals", fontsize=12)
-    ax.set_ylabel("Mean Recombination Time (ms)", fontsize=12)
+    ax.set_ylabel("Mean Recombination Time (seconds)", fontsize=12)
     ax.set_title(f"Recombination Time vs Individuals ({snps_lbl} SNPs)", fontsize=14)
     ax.set_xticks(ALL_INDIVIDUALS)
     ax.set_xticklabels(_inds_ticks(ALL_INDIVIDUALS))
