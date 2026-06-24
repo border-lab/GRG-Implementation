@@ -658,9 +658,8 @@ def plot_memory_vs_time(grg_rows, numpy_rows, projections, snps, output_path):
 
     # Annotate points
     for i, lbl in enumerate(grg_labels):
-        offset = (10, -5) if i == len(grg_labels) - 1 else (10, -18)
         ax.annotate(lbl, (grg_time[i], grg_mem[i]),
-                    textcoords="offset points", xytext=offset,
+                    textcoords="offset points", xytext=(10, 10),
                     fontsize=10, fontweight="bold", color="#1565C0")
 
     for i, lbl in enumerate(np_labels_m):
