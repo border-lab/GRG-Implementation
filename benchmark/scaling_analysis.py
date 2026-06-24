@@ -675,8 +675,8 @@ def plot_memory_vs_time(grg_rows, numpy_rows, projections, snps, output_path):
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Recombination Time (seconds, log scale)", fontsize=13)
-    ax.set_ylabel("Data Structure Size (GB, log scale)", fontsize=13)
-    ax.set_title(f"Data Structure Size vs Time — GRG vs NumPy ({snps_lbl} SNPs)",
+    ax.set_ylabel("Memory (GB, log scale)", fontsize=13)
+    ax.set_title(f"Memory vs Time — GRG vs NumPy ({snps_lbl} SNPs)",
                  fontsize=14)
     handles, labels = ax.get_legend_handles_labels()
     if handles:
