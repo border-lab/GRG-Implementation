@@ -414,6 +414,17 @@ def numpy_memory_analytical(num_individuals, num_snps):
 # Figures
 # ---------------------------------------------------------------------------
 
+# Colorblind-safe palette (Wong 2011) + distinct markers/linestyles
+_CLR_GRG = "#0072B2"
+_CLR_NUMPY = "#E69F00"
+_CLR_NUMPY_PROJ = "#E69F00"
+_MRK_GRG = "o"
+_MRK_NUMPY = "s"
+_LS_GRG = "-"
+_LS_NUMPY_MEASURED = "-"
+_LS_NUMPY_PROJECTED = "--"
+
+
 def _snps_label(snps):
     if snps >= 1_000_000 and snps % 1_000_000 == 0:
         return f"{int(snps // 1_000_000)}m"
@@ -448,15 +459,17 @@ def plot_time_vs_individuals(
     grg_at = filter_by_snps(grg_rows, snps)
     gx, gy, gy_err = extract_xy(grg_at)
     if len(gx):
-        ax.errorbar(gx, gy / 1000, yerr=gy_err / 1000, marker="o", capsize=4,
-                     label="GRG Native (measured)", color="#2196F3", linewidth=2)
+        ax.errorbar(gx, gy / 1000, yerr=gy_err / 1000, marker=_MRK_GRG,
+                     capsize=4, linestyle=_LS_GRG,
+                     label="GRG Native (measured)", color=_CLR_GRG, linewidth=2)
 
     # NumPy measured
     np_at = filter_by_snps(numpy_rows, snps)
     nx, ny, ny_err = extract_xy(np_at)
     if len(nx):
-        ax.errorbar(nx, ny / 1000, yerr=ny_err / 1000, marker="s", capsize=4,
-                     label="NumPy Baseline (measured)", color="#FF9800", linewidth=2)
+        ax.errorbar(nx, ny / 1000, yerr=ny_err / 1000, marker=_MRK_NUMPY,
+                     capsize=4, linestyle=_LS_NUMPY_MEASURED,
+                     label="NumPy Baseline (measured)", color=_CLR_NUMPY, linewidth=2)
 
     # NumPy projected
     proj_at = [p for p in projections if p.get("num_snps") == snps]
@@ -466,17 +479,18 @@ def plot_time_vs_individuals(
         if len(nx):
             bridge_x = np.array([nx[-1], px[0]])
             bridge_y = np.array([ny[-1] / 1000, py[0]])
-            ax.plot(bridge_x, bridge_y, "--", color="#FF9800", alpha=0.5, linewidth=1.5)
-        ax.plot(px, py, "s", markersize=8, markerfacecolor="none",
-                markeredgecolor="#FF9800", markeredgewidth=2)
-        ax.plot(px, py, "--", color="#FF9800", alpha=0.5, linewidth=1.5,
-                label="NumPy Baseline (projected)")
+            ax.plot(bridge_x, bridge_y, _LS_NUMPY_PROJECTED, color=_CLR_NUMPY_PROJ,
+                    alpha=0.5, linewidth=1.5)
+        ax.plot(px, py, _MRK_NUMPY, markersize=8, markerfacecolor="none",
+                markeredgecolor=_CLR_NUMPY_PROJ, markeredgewidth=2)
+        ax.plot(px, py, _LS_NUMPY_PROJECTED, color=_CLR_NUMPY_PROJ, alpha=0.5,
+                linewidth=1.5, label="NumPy Baseline (projected)")
 
     # Fitted curve (faint, full range)
     if best_name and best_name in models:
         x_curve = np.linspace(ALL_INDIVIDUALS[0], ALL_INDIVIDUALS[-1], 200)
         y_curve = models[best_name]["predict"](x_curve) / 1000
-        ax.plot(x_curve, y_curve, ":", color="#FF9800", alpha=0.3, linewidth=1,
+        ax.plot(x_curve, y_curve, ":", color=_CLR_NUMPY_PROJ, alpha=0.3, linewidth=1,
                 label=f"Fit: {models[best_name]['formula']}")
 
     # LOO annotation
@@ -522,15 +536,15 @@ def plot_time_vs_snps(grg_rows, numpy_rows, output_path):
         grg_at = [r for r in grg_rows if r["num_individuals"] == n_ind]
         gx, gy, gy_err = extract_xy(grg_at, x_key="snps_target")
         if len(gx):
-            ax.errorbar(gx, gy, yerr=gy_err, marker="o", capsize=4,
-                         color=colors[i], linewidth=2,
+            ax.errorbar(gx, gy, yerr=gy_err, marker=_MRK_GRG, capsize=4,
+                         color=colors[i], linewidth=2, linestyle=_LS_GRG,
                          label=f"GRG {ind_lbl} inds")
 
         np_at = [r for r in numpy_rows if r["num_individuals"] == n_ind]
         nx, ny, ny_err = extract_xy(np_at, x_key="snps_target")
         if len(nx):
-            ax.errorbar(nx, ny, yerr=ny_err, marker="s", capsize=4,
-                         color=colors[i], linewidth=2, linestyle="--",
+            ax.errorbar(nx, ny, yerr=ny_err, marker=_MRK_NUMPY, capsize=4,
+                         color=colors[i], linewidth=2, linestyle=_LS_NUMPY_PROJECTED,
                          label=f"NumPy {ind_lbl} inds")
 
     ax.set_yscale("log")
@@ -563,17 +577,15 @@ def plot_memory_vs_individuals(grg_rows, numpy_rows, output_path):
         grg_at = filter_by_snps(grg_rows, snps)
         gx, gy_mem, _ = extract_xy(grg_at, y_key="memory_mb")
         if len(gx):
-            ax.plot(gx, gy_mem / 1024, marker="o", linewidth=2,
+            ax.plot(gx, gy_mem / 1024, marker=_MRK_GRG, linewidth=2,
+                    linestyle=_LS_GRG, color=_CLR_GRG,
                     label=f"GRG RSS ({snps_lbl} SNPs)")
 
         # NumPy analytical memory (full range)
         mem_all = np.array([numpy_memory_analytical(n, snps) for n in ALL_INDIVIDUALS])
-        ax.plot(ALL_INDIVIDUALS, mem_all / 1024, marker="s", linewidth=2,
-                linestyle="--", label=f"NumPy matrix ({snps_lbl} SNPs)")
-
-    # 128 GB system limit
-    ax.axhline(y=128, color="red", linestyle=":", linewidth=1.5, alpha=0.7,
-               label="System limit (128 GB)")
+        ax.plot(ALL_INDIVIDUALS, mem_all / 1024, marker=_MRK_NUMPY, linewidth=2,
+                linestyle=_LS_NUMPY_PROJECTED, color=_CLR_NUMPY,
+                label=f"NumPy matrix ({snps_lbl} SNPs)")
 
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -618,8 +630,9 @@ def plot_memory_vs_time(grg_rows, numpy_rows, projections, snps, output_path):
         grg_labels.append(_inds_ticks([r["num_individuals"]])[0])
 
     if grg_time:
-        ax.plot(grg_time, grg_mem, "o-", color="#2196F3", linewidth=2.5,
-                markersize=10, label="GRG Native (graph size)", zorder=5)
+        ax.plot(grg_time, grg_mem, marker=_MRK_GRG, linestyle=_LS_GRG,
+                color=_CLR_GRG, linewidth=2.5, markersize=10,
+                label="GRG Native (graph size)", zorder=5)
 
     # NumPy measured
     np_at = filter_by_snps(numpy_rows, snps)
@@ -631,9 +644,9 @@ def plot_memory_vs_time(grg_rows, numpy_rows, projections, snps, output_path):
         np_labels_m.append(_inds_ticks([r["num_individuals"]])[0])
 
     if np_time_m:
-        ax.plot(np_time_m, np_mem_m, "s-", color="#FF9800", markersize=10,
-                linewidth=2.5, label="NumPy Baseline (matrix size, measured time)",
-                zorder=5)
+        ax.plot(np_time_m, np_mem_m, marker=_MRK_NUMPY, linestyle=_LS_NUMPY_MEASURED,
+                color=_CLR_NUMPY, markersize=10, linewidth=2.5,
+                label="NumPy Baseline (matrix size, measured time)", zorder=5)
 
     # NumPy projected
     proj_at = sorted(
@@ -648,29 +661,31 @@ def plot_memory_vs_time(grg_rows, numpy_rows, projections, snps, output_path):
 
         bridge_x = [np_time_m[-1]] + np_time_p if np_time_m else np_time_p
         bridge_y = [np_mem_m[-1]] + np_mem_p if np_mem_m else np_mem_p
-        ax.plot(bridge_x, bridge_y, "--", color="#FF9800", alpha=0.6,
-                linewidth=2, zorder=4)
-        ax.plot(np_time_p, np_mem_p, "s", markersize=10, markerfacecolor="none",
-                markeredgecolor="#FF9800", markeredgewidth=2.5,
-                label="NumPy Baseline (projected time)", zorder=5)
+        ax.plot(bridge_x, bridge_y, _LS_NUMPY_PROJECTED, color=_CLR_NUMPY_PROJ,
+                alpha=0.6, linewidth=2, zorder=4)
+        ax.plot(np_time_p, np_mem_p, _MRK_NUMPY, markersize=10,
+                markerfacecolor="none", markeredgecolor=_CLR_NUMPY_PROJ,
+                markeredgewidth=2.5, label="NumPy Baseline (projected time)",
+                zorder=5)
     else:
         np_time_p, np_mem_p, np_labels_p = [], [], []
 
     # Annotate points
     for i, lbl in enumerate(grg_labels):
+        xytext = (5, 12) if lbl == _inds_ticks([ALL_INDIVIDUALS[-1]])[0] else (-5, 12)
         ax.annotate(lbl, (grg_time[i], grg_mem[i]),
-                    textcoords="offset points", xytext=(10, 10),
-                    fontsize=10, fontweight="bold", color="#1565C0")
+                    textcoords="offset points", xytext=xytext,
+                    fontsize=10, fontweight="bold", color=_CLR_GRG)
 
     for i, lbl in enumerate(np_labels_m):
         ax.annotate(lbl, (np_time_m[i], np_mem_m[i]),
-                    textcoords="offset points", xytext=(-5, 10),
-                    fontsize=10, fontweight="bold", color="#E65100")
+                    textcoords="offset points", xytext=(-5, 12),
+                    fontsize=10, fontweight="bold", color=_CLR_NUMPY)
 
     for i, lbl in enumerate(np_labels_p):
         ax.annotate(lbl, (np_time_p[i], np_mem_p[i]),
-                    textcoords="offset points", xytext=(-30, 10),
-                    fontsize=10, fontweight="bold", color="#E65100")
+                    textcoords="offset points", xytext=(-5, 12),
+                    fontsize=10, fontweight="bold", color=_CLR_NUMPY_PROJ)
 
     ax.set_xscale("log")
     ax.set_yscale("log")
