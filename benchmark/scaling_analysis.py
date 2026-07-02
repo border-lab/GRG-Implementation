@@ -570,21 +570,25 @@ def plot_memory_vs_individuals(grg_rows, numpy_rows, output_path):
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    for snps in ALL_SNPS:
+    snps_linestyles = ["-", "--"]
+    snps_markers_grg = ["o", "^"]
+    snps_markers_np = ["s", "D"]
+
+    for idx, snps in enumerate(ALL_SNPS):
         snps_lbl = _snps_label(snps)
 
         # GRG measured RSS
         grg_at = filter_by_snps(grg_rows, snps)
         gx, gy_mem, _ = extract_xy(grg_at, y_key="memory_mb")
         if len(gx):
-            ax.plot(gx, gy_mem / 1024, marker=_MRK_GRG, linewidth=2,
-                    linestyle=_LS_GRG, color=_CLR_GRG,
+            ax.plot(gx, gy_mem / 1024, marker=snps_markers_grg[idx], linewidth=2,
+                    linestyle=snps_linestyles[idx], color=_CLR_GRG,
                     label=f"GRG RSS ({snps_lbl} SNPs)")
 
         # NumPy analytical memory (full range)
         mem_all = np.array([numpy_memory_analytical(n, snps) for n in ALL_INDIVIDUALS])
-        ax.plot(ALL_INDIVIDUALS, mem_all / 1024, marker=_MRK_NUMPY, linewidth=2,
-                linestyle=_LS_NUMPY_PROJECTED, color=_CLR_NUMPY,
+        ax.plot(ALL_INDIVIDUALS, mem_all / 1024, marker=snps_markers_np[idx], linewidth=2,
+                linestyle=snps_linestyles[idx], color=_CLR_NUMPY,
                 label=f"NumPy matrix ({snps_lbl} SNPs)")
 
     ax.set_xscale("log")
