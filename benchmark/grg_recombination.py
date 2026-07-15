@@ -48,7 +48,7 @@ def compute_grg_structural_stats(grg):
                 queue.append(child)
     sample_depths = [depth.get(s, 0) for s in samples]
 
-    mut_counts = [len(grg.get_mutations_for_node(i, allow_sort=False)) for i in range(n)]
+    mut_counts = [len(grg.get_mutations_for_node(i)) for i in range(n)]
     up_fanouts = [len(grg.get_up_edges(i)) for i in range(n)]
     down_fanouts = [len(grg.get_down_edges(i)) for i in range(n)]
 
@@ -344,7 +344,7 @@ class NonDuplicationRecombination:
             # ---- Populate mutation caches ----
             # Inlined from _get_node_mutations to avoid the dict-membership
             # check on every call during the init pass.
-            mut_ids = grg.get_mutations_for_node(node, allow_sort=False)
+            mut_ids = grg.get_mutations_for_node(node)
             mutations = []
             for mut_id in mut_ids:
                 mut = grg.get_mutation_by_id(mut_id)
@@ -415,7 +415,7 @@ class NonDuplicationRecombination:
 
     def _get_node_mutations(self, node_id):
         if node_id not in self._mutation_cache:
-            mut_ids = self.grg.get_mutations_for_node(node_id, allow_sort=False)
+            mut_ids = self.grg.get_mutations_for_node(node_id)
             mutations = []
             for mut_id in mut_ids:
                 mut = self.grg.get_mutation_by_id(mut_id)

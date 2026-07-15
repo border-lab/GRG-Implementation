@@ -14,6 +14,7 @@ benchmark/.venv
 benchmark/grgl
 benchmark/_debug_serialize_crash.py
 grgl
+grgl_wheels/
 
 # Ignore benchmark zip
 benchmark/recombination_benchmark.zip

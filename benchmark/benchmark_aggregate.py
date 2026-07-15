@@ -69,7 +69,7 @@ def group_runs(runs):
     return groups
 
 
-def aggregate_grg(runs):
+def aggregate_grg(runs, implementation="GRG Native"):
     times = [r["time_ms"] for r in runs]
     total_bp = sum(r["total_bp"] for r in runs)
     num_runs = len(runs)
@@ -100,7 +100,7 @@ def aggregate_grg(runs):
     row = {
         "file": first["file"],
         "num_offspring": first["num_offspring"],
-        "implementation": "GRG Native",
+        "implementation": implementation,
         "num_samples_initial": first["num_samples_initial"],
         "num_snps": first["num_snps"],
         "num_runs": num_runs,
@@ -157,7 +157,7 @@ def aggregate_numpy(runs):
 def collect_diagnostics(groups):
     diagnostics = {}
     for (fname, method), runs in groups.items():
-        if method != "grg":
+        if method not in ("grg", "grg_parallel"):
             continue
         file_diag = {}
         for r in runs:
@@ -183,7 +183,11 @@ def collect_diagnostics(groups):
             if "profile" in r:
                 file_diag["profile"] = r["profile"]
         if file_diag:
-            diagnostics[fname] = file_diag
+            # Keep the plain filename as key for "grg" (backward compatible
+            # with existing JSON consumers); disambiguate grg_parallel so it
+            # doesn't clobber the sequential entry when both ran on the same file.
+            key = fname if method == "grg" else f"{fname} [{method}]"
+            diagnostics[key] = file_diag
     return diagnostics
 
 
@@ -276,9 +280,12 @@ def main():
     rows = []
     for fname in file_order:
         grg_key = (fname, "grg")
+        grg_parallel_key = (fname, "grg_parallel")
         np_key = (fname, "numpy")
         if grg_key in groups:
-            rows.append(aggregate_grg(groups[grg_key]))
+            rows.append(aggregate_grg(groups[grg_key], implementation="GRG Native"))
+        if grg_parallel_key in groups:
+            rows.append(aggregate_grg(groups[grg_parallel_key], implementation="GRG Parallel"))
         if np_key in groups:
             rows.append(aggregate_numpy(groups[np_key]))
 

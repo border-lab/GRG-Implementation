@@ -131,6 +131,8 @@ class RecombinationBenchmarker:
         run_diagnostics: bool = False,
         serialize: bool = False,
         profile: bool = False,
+        engine: str = "sequential",
+        max_workers: int = None,
     ):
         self.grg_dir = grg_files_dir
         self.output_dir = output_dir
@@ -145,6 +147,12 @@ class RecombinationBenchmarker:
         self.run_diagnostics = run_diagnostics
         self.serialize = serialize
         self.profile = profile
+        # engine="parallel" swaps in ParallelNonDuplicationRecombination
+        # (node-aggregated discover+commit) everywhere this benchmarker
+        # would otherwise construct NonDuplicationRecombination.
+        self.engine = engine
+        self.max_workers = max_workers
+        self.implementation_label = "GRG Parallel" if engine == "parallel" else "GRG Native"
         self.results = []
         # Always-initialized so that verification_checks (which is a separate
         # concern from --diagnostics) can stash per-file results without
@@ -164,6 +172,20 @@ class RecombinationBenchmarker:
             cpu_count=multiprocessing.cpu_count(),
             timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
         )
+
+    def _make_recomb(self, g, instrument: bool = False):
+        if self.engine == "parallel":
+            from grg_recombination_parallel import ParallelNonDuplicationRecombination
+            return ParallelNonDuplicationRecombination(
+                g, instrument=instrument, max_workers=self.max_workers
+            )
+        return NonDuplicationRecombination(g, instrument=instrument)
+
+    @staticmethod
+    def _shutdown_recomb(recomb):
+        shutdown = getattr(recomb, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
 
     def _parse_expected_size(self, filename: str) -> tuple:
         """Extract expected individuals and SNPs from filename."""
@@ -383,7 +405,7 @@ class RecombinationBenchmarker:
             total_grg_bp = 0
             all_offspring_ids = []
             start = time.perf_counter()
-            recomb = NonDuplicationRecombination(g)
+            recomb = self._make_recomb(g)
             for gen in range(self.num_generations):
                 # Run GRG recombination for this generation
                 if debug:
@@ -542,6 +564,7 @@ class RecombinationBenchmarker:
             grg_size_changes.append(mem_after - mem_before)
             print(f"  [Run {i+1}] Memory usage: {mem_after:.1f} MB (Delta: +{mem_after - mem_before:.1f} MB)")
 
+            self._shutdown_recomb(recomb)
             del g
             del recomb
 
@@ -585,7 +608,7 @@ class RecombinationBenchmarker:
         if self.run_diagnostics:
             print(f"\nRunning instrumented diagnostic pass...")
             diag_g = pygrgl.load_mutable_grg(str(file_path))
-            diag_recomb = NonDuplicationRecombination(diag_g, instrument=True)
+            diag_recomb = self._make_recomb(diag_g, instrument=True)
             # _build_ancestral_caches runs in __init__ and writes
             # init_caches_time into stats. Capture it now -- the first
             # reset_stats() below would zero it out, and the init pass is
@@ -650,6 +673,7 @@ class RecombinationBenchmarker:
                 header=f"{file_path.name} -- {self.num_generations} gen(s) cumulative",
             )
 
+            self._shutdown_recomb(diag_recomb)
             del diag_g, diag_recomb
             gc.collect()
 
@@ -683,7 +707,7 @@ class RecombinationBenchmarker:
 
             print(f"\nRunning cProfile pass (1 generation, fresh graph)...")
             prof_g = pygrgl.load_mutable_grg(str(file_path))
-            prof_recomb = NonDuplicationRecombination(prof_g)
+            prof_recomb = self._make_recomb(prof_g)
 
             pr = cProfile.Profile()
             pr.enable()
@@ -710,6 +734,7 @@ class RecombinationBenchmarker:
                 'tottime_top30': tottime_output,
             }
 
+            self._shutdown_recomb(prof_recomb)
             del prof_g, prof_recomb
             gc.collect()
 
@@ -765,7 +790,7 @@ class RecombinationBenchmarker:
 
         self.results.append(BenchmarkResult(
             file=file_path.name, num_offspring=actual_offspring_generated,
-            implementation="GRG Native", num_samples_initial=base_samples,
+            implementation=self.implementation_label, num_samples_initial=base_samples,
             num_snps=base_mutations, num_runs=self.num_runs,
             num_bp=total_grg_bp, mean_bp=grg_bp_mean,
             mean_time_ms=grg_mean, std_time_ms=grg_std,
@@ -793,7 +818,7 @@ class RecombinationBenchmarker:
 
         print(f"\nResults for {file_path.name}:\n")
 
-        print(f"  GRG Native:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
+        print(f"  {self.implementation_label}:     {grg_mean:.2f}ms ± {grg_std:.2f}ms")
         print(f"  Space Delta:    +{nodes_added_per_run:.2f} nodes created per run on average")
         print(f"  Edge Delta:     +{edges_added_per_run:.2f} edges created per run on average")
         print(f"  GRG Breakpoints: {grg_bp_mean:.2f} average breakpoints per generation")
@@ -1055,6 +1080,14 @@ if __name__ == "__main__":
                              "costliest call chains; tottime isolates where CPU is actually "
                              "spent (e.g. pure traversal in _recurse_attach vs cache-miss DFS "
                              "in _get_node_and_ancestor_span). Off the timed path. Default off.")
+    parser.add_argument("--engine", choices=["sequential", "parallel"], default="sequential",
+                        help="'sequential' uses NonDuplicationRecombination (default); "
+                             "'parallel' uses ParallelNonDuplicationRecombination "
+                             "(node-aggregated discover+commit) for the GRG phase "
+                             "(including --diagnostics and --profile passes).")
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="Thread-pool size for --engine parallel's discovery phase "
+                             "(default: os.cpu_count()). Ignored for --engine sequential.")
 
     args = parser.parse_args()
 
@@ -1071,6 +1104,8 @@ if __name__ == "__main__":
         run_diagnostics=args.diagnostics,
         serialize=args.serialize,
         profile=args.profile,
+        engine=args.engine,
+        max_workers=args.max_workers,
     )
     
     benchmarker.run_benchmarks()

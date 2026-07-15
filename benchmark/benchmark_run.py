@@ -53,6 +53,8 @@ else:
     from grg_recombination import NonDuplicationRecombination
     _BACKEND = "python"
 
+from grg_recombination_parallel import ParallelNonDuplicationRecombination
+
 from grg_numpy_baseline import (
     grg_to_numpy_parallel,
     estimate_numpy_memory,
@@ -180,6 +182,28 @@ def system_info():
     }
 
 
+def _make_recomb(engine, g, instrument=False, max_workers=None):
+    """Construct the requested recombination engine.
+
+    `engine="parallel"` selects `ParallelNonDuplicationRecombination` (the
+    node-aggregated discover+commit algorithm); anything else falls back to
+    the sequential `NonDuplicationRecombination` reference. `max_workers`
+    only applies to the parallel engine.
+    """
+    if engine == "parallel":
+        return ParallelNonDuplicationRecombination(
+            g, instrument=instrument, max_workers=max_workers
+        )
+    return NonDuplicationRecombination(g, instrument=instrument)
+
+
+def _shutdown_recomb(recomb):
+    """Best-effort thread-pool teardown; no-op for the sequential engine."""
+    shutdown = getattr(recomb, "shutdown", None)
+    if shutdown is not None:
+        shutdown()
+
+
 def run_grg(
     grg_file: Path,
     run_index: int,
@@ -189,9 +213,12 @@ def run_grg(
     diagnostics: bool = False,
     serialize: bool = False,
     profile: bool = False,
+    engine: str = "sequential",
+    max_workers: int = None,
 ):
     provider = BreakpointProvider(offspring_per_couple)
     fname = grg_file.name
+    method_name = "grg_parallel" if engine == "parallel" else "grg"
 
     print(f"[GRG run {run_index}] Loading {fname}...")
     load_t0 = time.time()
@@ -208,7 +235,7 @@ def run_grg(
 
     result = {
         "file": fname,
-        "method": "grg",
+        "method": method_name,
         "run_index": run_index,
         "num_samples_initial": base_samples,
         "num_snps": base_mutations,
@@ -254,7 +281,7 @@ def run_grg(
     liveness_snapshots = []
 
     start = time.perf_counter()
-    recomb = NonDuplicationRecombination(g)
+    recomb = _make_recomb(engine, g, max_workers=max_workers)
     for gen in range(num_generations):
         print(f"  [Gen {gen+1}] Running GRG recombination...")
         offspring_ids, gen_bp = simulate_grg_recombination(
@@ -395,7 +422,7 @@ def run_grg(
     if diagnostics:
         print(f"[GRG run {run_index}] Running instrumented diagnostic pass...")
         diag_g = pygrgl.load_mutable_grg(str(grg_file))
-        diag_recomb = NonDuplicationRecombination(diag_g, instrument=True)
+        diag_recomb = _make_recomb(engine, diag_g, instrument=True, max_workers=max_workers)
         init_caches_time_s = diag_recomb.stats["init_caches_time"]
         per_gen_stats = []
         diag_total_start = time.perf_counter()
@@ -420,7 +447,7 @@ def run_grg(
                   f"offspring={snapshot['offspring_count']} bubbles={snapshot['bubbles_created']}")
         diag_total = time.perf_counter() - diag_total_start
 
-        aggregated_audit = NonDuplicationRecombination._fresh_audit()
+        aggregated_audit = diag_recomb.__class__._fresh_audit()
         for snap in per_gen_stats:
             for k, v in snap.get("audit", {}).items():
                 aggregated_audit[k] = aggregated_audit.get(k, 0) + v
@@ -431,6 +458,7 @@ def run_grg(
             "per_generation": per_gen_stats,
             "audit_aggregated": aggregated_audit,
         }
+        _shutdown_recomb(diag_recomb)
         del diag_g, diag_recomb
         gc.collect()
 
@@ -441,7 +469,7 @@ def run_grg(
 
         print(f"[GRG run {run_index}] Running cProfile pass...")
         prof_g = pygrgl.load_mutable_grg(str(grg_file))
-        prof_recomb = NonDuplicationRecombination(prof_g)
+        prof_recomb = _make_recomb(engine, prof_g, max_workers=max_workers)
         pr = cProfile.Profile()
         pr.enable()
         simulate_grg_recombination(provider, prof_recomb, base_genome, N=base_genome[1])
@@ -462,9 +490,11 @@ def run_grg(
             "cumtime_top30": cumtime_output,
             "tottime_top30": tottime_output,
         }
+        _shutdown_recomb(prof_recomb)
         del prof_g, prof_recomb
         gc.collect()
 
+    _shutdown_recomb(recomb)
     del g, recomb
     gc.collect()
     return result
@@ -545,8 +575,13 @@ def main():
     )
     parser.add_argument("--grg-file", type=Path, required=True,
                         help="Path to a single .grg file")
-    parser.add_argument("--method", choices=["grg", "numpy"], required=True,
-                        help="Which method to benchmark")
+    parser.add_argument("--method", choices=["grg", "grg_parallel", "numpy"], required=True,
+                        help="Which method to benchmark. 'grg_parallel' uses "
+                             "ParallelNonDuplicationRecombination (node-aggregated "
+                             "discover+commit) instead of the sequential reference.")
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="Thread-pool size for --method grg_parallel's discovery "
+                             "phase (default: os.cpu_count()). Ignored otherwise.")
     parser.add_argument("--run-index", type=int, required=True,
                         help="Run index (0-based), used for output naming")
     parser.add_argument("--num-generations", type=int, default=1,
@@ -583,7 +618,7 @@ def main():
     print(f"System: {sysinfo['platform']}, CPUs: {sysinfo['cpu_count']}, "
           f"Backend: {sysinfo['backend']}")
 
-    if args.method == "grg":
+    if args.method in ("grg", "grg_parallel"):
         result = run_grg(
             grg_file=args.grg_file,
             run_index=args.run_index,
@@ -593,6 +628,8 @@ def main():
             diagnostics=args.diagnostics,
             serialize=args.serialize,
             profile=args.profile,
+            engine="parallel" if args.method == "grg_parallel" else "sequential",
+            max_workers=args.max_workers,
         )
     else:
         result = run_numpy(

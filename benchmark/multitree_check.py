@@ -396,6 +396,11 @@ def main():
                         help="Offspring rows produced per mating couple (default: 2).")
     parser.add_argument("--output-json", type=Path, default=None,
                         help="Optional path to dump full per-offspring violation list as JSON.")
+    parser.add_argument("--parallel", action="store_true",
+                        help="Use ParallelNonDuplicationRecombination (node-aggregated "
+                             "discover+commit) instead of the sequential reference.")
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="Thread-pool size for --parallel (default: os.cpu_count()).")
     args = parser.parse_args()
 
     if not args.grg_path.exists():
@@ -412,18 +417,23 @@ def main():
     print(f"  loaded: {initial_num_nodes:,} nodes, {grg.num_edges:,} edges, "
           f"{grg.num_samples:,} samples, {grg.num_mutations:,} mutations")
 
-    print(f"Running one generation of recombination "
+    engine_label = "parallel" if args.parallel else "sequential"
+    print(f"Running one generation of recombination with the {engine_label} engine "
           f"(num_offspring_per_couple={args.offspring_per_couple})...")
     t = time.perf_counter()
-    from grg_recombination import (
-        NonDuplicationRecombination,
-        simulate_grg_recombination,
-    )
-    recomb = NonDuplicationRecombination(grg)
+    from grg_recombination import simulate_grg_recombination
+    if args.parallel:
+        from grg_recombination_parallel import ParallelNonDuplicationRecombination
+        recomb = ParallelNonDuplicationRecombination(grg, max_workers=args.max_workers)
+    else:
+        from grg_recombination import NonDuplicationRecombination
+        recomb = NonDuplicationRecombination(grg)
     stub = BenchmarkStub(num_offspring_per_couple=args.offspring_per_couple)
     new_offspring_ids, total_bp = simulate_grg_recombination(
         stub, recomb, grg.bp_range, grg.bp_range[1]
     )
+    if args.parallel:
+        recomb.shutdown()
     print(f"  done in {time.perf_counter() - t:.2f}s "
           f"({len(new_offspring_ids):,} offspring, {total_bp:,} breakpoints, "
           f"{grg.num_nodes - initial_num_nodes:,} new nodes total)")
